@@ -1,0 +1,37 @@
+# Prometheus 配置 / Prometheus config
+# Flink 1.13 自带 PrometheusReporter, JM/TM 各暴露一个端口
+# 跨节点抓取靠节点内网 IP
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Flink JobManager (master 节点)
+  - job_name: 'flink-jobmanager'
+    static_configs:
+      - targets: ['__NODE_MASTER_IP__:9249']
+        labels: { component: 'jobmanager' }
+
+  # Flink TaskManagers (worker 节点)
+  - job_name: 'flink-taskmanagers'
+    static_configs:
+      - targets:
+          - '__NODE_WORKER1_IP__:9249'
+          - '__NODE_WORKER2_IP__:9249'
+        labels: { component: 'taskmanager' }
+
+  # node_exporter (3 节点的 CPU/内存/网络, 实验 3 可扩展性用)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['__NODE_MASTER_IP__:9100']
+        labels: { node: 'master' }
+      - targets: ['__NODE_WORKER1_IP__:9100']
+        labels: { node: 'worker1' }
+      - targets: ['__NODE_WORKER2_IP__:9100']
+        labels: { node: 'worker2' }
+
+  # Prometheus 自监控
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

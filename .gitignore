@@ -1,0 +1,103 @@
+# ==========================================
+# 1. 用户自定义屏蔽 (Custom)
+# ==========================================
+CLAUDE.md
+
+# ==========================================
+# 2. Maven 编译与临时文件 (Maven)
+# ==========================================
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# ==========================================
+# 3. IntelliJ IDEA 配置文件 (IDE)
+# ==========================================
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# ==========================================
+# 4. Java & Scala 编译文件及日志 (Java/Scala)
+# ==========================================
+*.class
+*.log
+*.ctxt
+# 屏蔽打包生成的压缩文件 (Fat Jar 等)
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+*.tar
+# JVM 崩溃日志
+hs_err_pid*
+replay_pid*
+
+# ==========================================
+# 5. Mac 操作系统临时文件 (OS)
+# ==========================================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+# ==========================================
+# 6. 本地测试数据与日志 (Data & Logs)
+# ==========================================
+# 屏蔽常见的纯文本和结构化数据文件
+*.csv
+*.tsv
+*.json
+*.txt
+*.dat
+# 如果有纯日志文件，屏蔽之（注意不要屏蔽掉代码里的 log4j 配置文件）
+*.log
+# 屏蔽大数据列式存储文件
+*.parquet
+*.orc
+*.avro
+*.jsonl
+# 实验进度日志
+deploy/batch-progress-*.log
+deploy/*.out
+deploy/*.pid
+deploy/.build/
+# Python / Mac
+__pycache__/
+*.pyc
+.DS_Store
+# ==========================================
+# 7. 本地数据存放目录 (Data Directories)
+# ==========================================
+# 强烈建议您在项目根目录建一个 data/ 文件夹放数据，并在此整体屏蔽
+data/
+datasets/
+mock_data/
+results-local/
+# ==========================================
+# 8. Flink 本地运行状态与检查点 (Flink State)
+# ==========================================
+# 屏蔽 Flink 在本地测试时生成的 Checkpoint/Savepoint 目录
+checkpoint/
+savepoints/
+# 屏蔽 RocksDB 本地临时目录（如果您在本地开启了 RocksDB）
+rocksdb/

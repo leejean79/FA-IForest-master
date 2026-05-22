@@ -1,0 +1,179 @@
+# ============================================================================
+# datasets.yml - 数据集元数据 registry
+# 每个数据集写一次, run-experiment.sh 自动查
+# ============================================================================
+# 字段说明 / Field semantics:
+#   path                CSV 路径 (相对于项目根)
+#   hasHeader           CSV 是否有第一行字段名
+#   hasId               每行第一列是否是 id (LocalProcessor 会跳过)
+#   hasLabel            是否有 label 列
+#   labelPosition       label 在哪 (last | first | <列号 0-based>)
+#   anomalyLabel        哪个 label 值代表异常 (str, 因为可能是 "1" 或 "anomaly")
+#   n_samples           样本数 (用来判定实验完成: output-scores offset == n_samples)
+#   dimensions          特征维度 (用来 sanity check)
+#   notes               人类备注
+#   drift_events        (可选) 漂移事件元数据, 给 analyze.py 计算 detection latency
+#
+# 注: 实际 CSV 的预处理脚本(异常转换/列对齐) 由 analysis/ 下脚本完成
+#     这里只描述"最终用于实验的 CSV"的格式
+# ============================================================================
+
+datasets:
+
+  # ====================== 合成漂移数据 (gen_synth_drift_v2.py 产出) ======================
+  synth_abrupt:
+    path: data/synth/synth_abrupt.csv
+    hasHeader: true
+    hasId: true                              # synth CSV 有 id 列
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 100000
+    dimensions: 5
+    notes: "abrupt drift @ line 50000"
+    drift_spec: data/synth/synth_abrupt.driftspec.json
+
+  synth_gradual:
+    path: data/synth/synth_gradual.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 100000
+    dimensions: 5
+    notes: "gradual drift, prob-mix region [40000, 60000]"
+    drift_spec: data/synth/synth_gradual.driftspec.json
+
+  synth_incremental:
+    path: data/synth/synth_incremental.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 100000
+    dimensions: 5
+    notes: "incremental linear drift [20000, 80000]"
+    drift_spec: data/synth/synth_incremental.driftspec.json
+
+  synth_reoccurring:
+    path: data/synth/synth_reoccurring.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 100000
+    dimensions: 5
+    notes: "reoccurring drift, switches @ 30k/60k/90k"
+    drift_spec: data/synth/synth_reoccurring.driftspec.json
+
+  # ====================== 实验 2 stationary 数据集 ======================
+  # Online-iForest 论文 Table 2 提到的, 各自的 hasHeader/hasId/hasLabel 由用户填
+  # 30 次 shuffle 由 shuffle_csv.py 生成, 注册时只写"原始"那份, shuffle 版本由 run-batch 动态指向
+
+  # 注: 以下 5 个数据集格式统一: id,x0..xN,y (有 header, 有 id 列, label 列名 y)
+  #     分隔符逗号, 文件后缀 .txt, 异常 label = 1
+  #     字段值来自 validate-datasets.sh 实测 (非论文猜测)
+
+  http:
+    path: data/stationary/Http.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 567498
+    dimensions: 3                            # x0-x2
+    notes: "KDD'99 http. 实测 anomaly 2211 (0.39%)"
+
+  smtp:
+    # 注: 你的实验 2 计划用 donors/http/forestcover/fraud/mulcross, 不含 smtp
+    #     如果以后要用, 跑 validate-datasets.sh 确认后填
+    path: data/stationary/Smtp.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 0                             # TODO: 未实测, 用前确认
+    dimensions: 3
+    notes: "KDD'99 smtp. 字段未实测, 用前跑 validate-datasets.sh"
+
+  forestcover:
+    path: data/stationary/ForestCover.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 286048
+    dimensions: 10                           # x0-x9
+    notes: "Covertype. 实测 anomaly 2747 (0.96%)"
+
+  mulcross:
+    path: data/stationary/Mulcross.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 262144
+    dimensions: 4                            # x0-x3
+    notes: "Synthetic Mulcross. 实测 anomaly 26214 (10.0%)"
+
+  fraud:
+    path: data/stationary/fraud.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 284807
+    dimensions: 28                           # x0-x27 (不是 30!)
+    notes: "Kaggle credit card fraud. 实测 anomaly 492 (0.17%)"
+
+  donors:
+    path: data/stationary/donors.txt
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 619326
+    dimensions: 10                           # x0-x9
+    notes: "DonorsChoose. 实测 anomaly 36710 (5.93%)"
+
+  # ====================== INSECTS 漂移数据集 (已转换) ======================
+  # 转换规则: 频率法, top-2 多数类 → normal(0), 最少 1 类 → anomaly(1), 其余丢弃
+  # 由 analysis/transform_insects.py 产出, 列: id,f0..f32,label
+  # drift_events 的 line 是"转换后" CSV 行号 (从 driftspec.json 拿)
+
+  insects_abrupt_imbalanced:
+    path: data/insects/INSECTS_abrupt_imbalanced_transformed.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 212514                        # 实测, = Online-iForest 论文数字
+    dimensions: 33                           # f0-f32
+    notes: "INSECTS abrupt. normal={2,12}, anomaly={5}. anomaly 5.506% (11701/212514)"
+    drift_type: abrupt
+    drift_spec: data/insects/INSECTS_abrupt_imbalanced_transformed.driftspec.json
+    drift_events: [51255, 74381, 100944, 142291, 152207]   # transformed_line
+
+  insects_gradual_imbalanced:
+    path: data/insects/INSECTS_gradual_imbalanced_transformed.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 78470                         # 实测
+    dimensions: 33
+    notes: "INSECTS gradual. normal={12,3}, anomaly={5}. anomaly 6.20% (4867/78470)"
+    drift_type: gradual
+    drift_spec: data/insects/INSECTS_gradual_imbalanced_transformed.driftspec.json
+    drift_events: [32096]   # transformed_line

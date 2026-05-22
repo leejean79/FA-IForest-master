@@ -1,0 +1,7 @@
+# Flink 1.13.6 镜像 (官方镜像已预装 prometheus reporter 插件于
+#   /opt/flink/plugins/metrics-prometheus/flink-metrics-prometheus-1.13.6.jar
+# 直接 FROM 即可 / Official image already ships the prometheus reporter plugin.)
+FROM flink:1.13.6-scala_2.12-java8
+
+# 提供 job jar 挂载点 / Mount point for user job jar
+RUN mkdir -p /opt/flink/usrlib

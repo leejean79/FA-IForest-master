@@ -1,0 +1,126 @@
+# ============================================================================
+# Master 节点 / Master node:
+#   ZooKeeper + Kafka broker-1 + Flink JobManager + Prometheus + Grafana
+# ============================================================================
+# 启动 / Start:  docker compose -f docker-compose.master.yml --env-file ../.env up -d
+# 停止 / Stop:   docker compose -f docker-compose.master.yml down
+# 日志 / Logs:   docker compose -f docker-compose.master.yml logs -f <service>
+# ============================================================================
+# 镜像选择 / Image choice:
+#   ZK/Kafka 用 wurstmeister 系列 (社区维护 8 年, 国内镜像源同步好)
+#   原因: 2025-08 起 bitnami 系列已全面从 Docker Hub 下架,
+#         所有 bitnami/kafka:* 和 bitnami/zookeeper:* 拉取必 fail
+# ============================================================================
+
+services:
+
+  # -------- ZooKeeper (Kafka 2.6.x 还依赖 ZK, 不用 KRaft) --------
+  zookeeper:
+    image: wurstmeister/zookeeper:latest
+    container_name: zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    networks:
+      - fa-net
+
+  # -------- Kafka broker-1 (在 master 节点) --------
+  # advertised.listeners 用 master 内网 IP, 跨节点 producer/consumer 才能连得到
+  kafka-1:
+    image: wurstmeister/kafka:2.13-2.6.3
+    container_name: kafka-1
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: ${NODE_MASTER_IP}:2181
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://${NODE_MASTER_IP}:9092,EXTERNAL://${NODE_MASTER_PUBLIC_IP:-${NODE_MASTER_IP}}:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${TOPIC_REPLICATION}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${TOPIC_REPLICATION}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    networks:
+      - fa-net
+
+  # -------- Flink JobManager --------
+  # host 网络模式: 跨节点访问 Flink 时所有端口直接可达
+  # (8081 REST UI, 6123 RPC, 6124 BlobServer, 49xxx 动态 metrics RPC)
+  # bridge 模式只能转发显式 ports, 但 Flink 跨节点要用动态端口, 必须 host
+  jobmanager:
+    image: fa-iforest/flink:${FLINK_VERSION}
+    container_name: jobmanager
+    restart: unless-stopped
+    network_mode: host
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: ${NODE_MASTER_IP}
+        jobmanager.rpc.port: 6123
+        jobmanager.memory.process.size: ${JM_HEAP_MB}m
+        parallelism.default: ${JOB_LOCAL_PARALLELISM}
+        rest.address: 0.0.0.0
+        rest.bind-address: 0.0.0.0
+        metrics.reporters: prom
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+    volumes:
+      - ${REMOTE_HOME}/jars:/opt/flink/usrlib
+
+  # -------- Prometheus(可选) --------
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    volumes:
+      - ${REMOTE_HOME}/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    networks:
+      - fa-net
+
+  # -------- Grafana(可选) --------
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    restart: unless-stopped
+    profiles: ["monitoring"]
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - fa-net
+
+  # -------- node-exporter (采集 master 宿主机 CPU/内存/网络) --------
+  # host 网络 + 挂载 /proc /sys, 才能采到宿主机真实指标 (不是容器的)
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - '--path.rootfs=/host'
+      - '--web.listen-address=:9100'
+    volumes:
+      - /:/host:ro,rslave
+
+volumes:
+  prom-data:
+  grafana-data:
+
+networks:
+  fa-net:
+    driver: bridge

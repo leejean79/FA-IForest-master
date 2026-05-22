@@ -1,0 +1,76 @@
+# ============================================================================
+# Worker 节点 / Worker node:
+#   Kafka broker-${BROKER_ID} + Flink TaskManager
+# ============================================================================
+# 启动 / Start:
+#   BROKER_ID=2 NODE_SELF_IP=$NODE_WORKER1_IP \
+#     docker compose -f docker-compose.worker.yml --env-file ../.env up -d
+#   BROKER_ID=3 NODE_SELF_IP=$NODE_WORKER2_IP \
+#     docker compose -f docker-compose.worker.yml --env-file ../.env up -d
+# ============================================================================
+# 镜像选择 / Image choice: wurstmeister (bitnami 已下架, 见 master compose 注释)
+# ============================================================================
+
+services:
+
+  # -------- Kafka broker-N --------
+  kafka:
+    image: wurstmeister/kafka:2.13-2.6.3
+    container_name: kafka-${BROKER_ID}
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: ${BROKER_ID}
+      KAFKA_ZOOKEEPER_CONNECT: ${NODE_MASTER_IP}:2181
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://${NODE_SELF_IP}:9092,EXTERNAL://${NODE_SELF_IP}:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${TOPIC_REPLICATION}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${TOPIC_REPLICATION}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    networks:
+      - fa-net
+
+  # -------- Flink TaskManager --------
+  # host 网络模式: 跨节点访问时所有端口可达 (RPC 6122, BlobServer, 动态 metrics 端口)
+  # taskmanager.host: 容器内 Flink 用此 IP 向 JM 注册自己, host 网络下就是节点内网 IP
+  taskmanager:
+    image: fa-iforest/flink:${FLINK_VERSION}
+    container_name: taskmanager-${BROKER_ID}
+    restart: unless-stopped
+    network_mode: host
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: ${NODE_MASTER_IP}
+        jobmanager.rpc.port: 6123
+        taskmanager.numberOfTaskSlots: ${TM_SLOTS}
+        taskmanager.memory.process.size: ${TM_HEAP_MB}m
+        taskmanager.memory.managed.size: ${TM_MANAGED_MEM_MB}m
+        taskmanager.host: ${NODE_SELF_IP}
+        parallelism.default: ${JOB_LOCAL_PARALLELISM}
+        metrics.reporters: prom
+        metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+        metrics.reporter.prom.port: 9249
+
+  # -------- node-exporter (采集 worker 宿主机指标) --------
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: node-exporter-${BROKER_ID}
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - '--path.rootfs=/host'
+      - '--web.listen-address=:9100'
+    volumes:
+      - /:/host:ro,rslave
+
+networks:
+  fa-net:
+    driver: bridge
