@@ -31,13 +31,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+RUN_MODE="${RUN_MODE:-remote}"
+SSH_OPTS="-i ${SSH_KEY:-} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 MASTER_SSH="${NODE_MASTER_PUBLIC_IP:-$NODE_MASTER_IP}"
 BROKERS="$NODE_MASTER_IP:9092,$NODE_WORKER1_IP:9092,$NODE_WORKER2_IP:9092"
 
-kcmd() {
-    ssh $SSH_OPTS "$SSH_USER@$MASTER_SSH" "docker exec kafka-1 $*"
-}
+if [[ "$RUN_MODE" == "local" ]]; then
+    kcmd() { docker exec kafka-1 "$@"; }
+else
+    kcmd() { ssh $SSH_OPTS "$SSH_USER@$MASTER_SSH" "docker exec kafka-1 $*"; }
+fi
 
 # 6 个 topic
 TOPICS=(

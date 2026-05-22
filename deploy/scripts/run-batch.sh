@@ -18,6 +18,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
 set -a; source "$DEPLOY_DIR/.env"; set +a
 
+# RUN_MODE (remote=mac ssh / local=master本地) 传给子进程 run-experiment
+export RUN_MODE="${RUN_MODE:-remote}"
+
 CFG="python3 $SCRIPT_DIR/cfg_query.py"
 
 PLAN=""; DRY_RUN=false

@@ -67,15 +67,25 @@ EXP_ID="${DATASET}_${CONFIG_ID}_${algo_tag}_p${PARALLELISM}_r${RUN_ID}"
 [[ -n "$EXTRA_PARAM" ]] && EXP_ID="${EXP_ID}_${EXTRA_PARAM//=/-}"
 
 # ---------- 连接配置 ----------
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# RUN_MODE: remote (mac 上, ssh 进集群, 默认) | local (master 上, 本地执行)
+RUN_MODE="${RUN_MODE:-remote}"
+export RUN_MODE   # 传给子进程 clean-topics.sh
+SSH_OPTS="-i ${SSH_KEY:-} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 MASTER="${NODE_MASTER_PUBLIC_IP:-$NODE_MASTER_IP}"
 BROKERS="$NODE_MASTER_IP:9092,$NODE_WORKER1_IP:9092,$NODE_WORKER2_IP:9092"
 REMOTE_DATA="$REMOTE_HOME/datasets"
 RESULT_DIR="$REMOTE_HOME/results/$EXP_ID"
 JAR="/opt/flink/usrlib/$JOB_JAR_NAME"
 
-ssh_master() { ssh $SSH_OPTS "$SSH_USER@$MASTER" "$@"; }
-kcmd() { ssh_master "docker exec kafka-1 $*"; }
+if [[ "$RUN_MODE" == "local" ]]; then
+    # master 上本地执行 (无 ssh)
+    ssh_master() { bash -c "$*"; }
+    kcmd() { docker exec kafka-1 "$@"; }
+else
+    # mac 上 ssh 进 master
+    ssh_master() { ssh $SSH_OPTS "$SSH_USER@$MASTER" "$@"; }
+    kcmd() { ssh_master "docker exec kafka-1 $*"; }
+fi
 
 echo "════════════════════════════════════════════════════"
 echo "EXPERIMENT: $EXP_ID"
