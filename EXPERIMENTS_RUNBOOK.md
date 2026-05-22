@@ -55,15 +55,25 @@ bash deploy/scripts/run-batch.sh --plan exp1 --dry-run
 
 ### 2.2 真跑 (建议挂后台 / nohup)
 
-实验耗时长 (exp1 约 6-8 小时), 用 `nohup` 防止 ssh 断开中断:
+实验耗时长 (exp1 约 6-8 小时), 用 `nohup` 防止 ssh 断开中断。
+**关键: 必须加 `< /dev/null`** 把 stdin 接到空设备:
 
 ```bash
-nohup bash deploy/scripts/run-batch.sh --plan exp1 > exp1.out 2>&1 &
+nohup bash deploy/scripts/run-batch.sh --plan exp1 > exp1.out 2>&1 < /dev/null &
 echo $! > exp1.pid          # 记下进程号
+
+# 立刻确认是 Running 不是 Stopped
+jobs
 
 # 看实时输出
 tail -f exp1.out
 ```
+
+**为什么必须 `< /dev/null`**: 脚本里大量 `ssh fa-master "..."`, ssh 默认会读 stdin。
+后台 (`&`) 跑且没重定向 stdin 时, ssh 抢终端 stdin 触发 SIGTTIN → 整个进程 `Stopped` (卡住不跑)。
+`< /dev/null` 让 stdin 接空设备, ssh 读到 EOF 不抢终端。
+**症状**: 启动后 `jobs` 显示 `[1]+ Stopped` 而不是 `Running`, `exp1.out` 卡在某步不动。
+**修复**: kill 掉, 加 `< /dev/null` 重挂。
 
 ### 2.3 单次实验 (调试用)
 
@@ -114,6 +124,25 @@ bash deploy/scripts/cluster-monitor.sh -i 5   # 5 秒刷新
 
 显示: 3 节点 CPU/内存 / 容器状态 / Flink jobs / 6 个 topic offset / 当前实验。
 Ctrl+C 退出 (会清理 ssh 复用连接)。
+
+### 4.1 从另一台机器查看实验 (如 Air 开发机)
+
+实验主控进程 (run-batch.sh) 跑在**发起 nohup 的那台 mac** 上, 不在集群。
+另一台机器能**查看**集群侧状态, 但**控制** (停止/重启批量) 要回主控那台。
+
+另一台机器 (配好 ssh fa-master + .env) 可做:
+```bash
+# 看集群侧进度 (这些数据在集群, 任何机器 ssh 都能看)
+ssh fa-master "ls /opt/fa-iforest/results/ | wc -l"          # 完成几个实验
+ssh fa-master "docker exec jobmanager flink list"            # 当前跑什么
+bash deploy/scripts/cluster-monitor.sh                       # 实时监控
+
+# 不能做 (这些文件在主控 mac 上, 不在集群):
+#   tail exp1.out / cat batch-progress / kill exp1.pid
+```
+
+要让两台机器对等控制, 需把主控进程改到 master 上跑 (现脚本设计为从 mac ssh 进集群,
+未做此改造)。当前设计下: 一台 mac 当主控发起实验, 另一台 ssh 进集群只读查看。
 
 ---
 
@@ -174,10 +203,10 @@ mode: `drift` (实验1/4) / `stationary` (实验2) / `scalability` (实验3) / `
 
 ```bash
 # 先跑不依赖 IKS 的实验 (用现有 HDDM_A_Windowed)
-nohup bash deploy/scripts/run-batch.sh --plan exp1 > exp1.out 2>&1 &
+nohup bash deploy/scripts/run-batch.sh --plan exp1 > exp1.out 2>&1 < /dev/null &
 # exp1 完成后:
-nohup bash deploy/scripts/run-batch.sh --plan exp2 > exp2.out 2>&1 &
-nohup bash deploy/scripts/run-batch.sh --plan exp3 > exp3.out 2>&1 &
+nohup bash deploy/scripts/run-batch.sh --plan exp2 > exp2.out 2>&1 < /dev/null &
+nohup bash deploy/scripts/run-batch.sh --plan exp3 > exp3.out 2>&1 < /dev/null &
 bash deploy/scripts/run-batch.sh --plan sensitivity
 
 # 全部完成后拉结果分析
@@ -210,8 +239,11 @@ A: 不会。clean-topics.sh 是 delete→create (不是 alter), 任意 partition
 **Q: IP 变了连不上?**
 A: stop-saved 模式重启 IP 会变。`bash deploy/scripts/refresh-ips.sh` 刷新 .env 里的公网 IP。
 
-**Q: 想中途停止批量?**
-A: `kill $(cat exp1.pid)`。已完成的结果保留, 重跑同 plan 会断点续跑。
+**Q: nohup 启动后 `jobs` 显示 Stopped, exp1.out 卡住不动?**
+A: ssh 抢 stdin 导致 SIGTTIN。nohup 命令漏了 `< /dev/null`。kill 掉进程, 清残留 (cancel 集群上已提交的 job + 删 dumper + 删半截结果目录), 用 `nohup ... > exp1.out 2>&1 < /dev/null &` 重挂。注意: 进程 Stopped 期间脚本可能已在集群提交了 job, kill 本地进程不会停远端 job, 要手动 cancel。
+
+**Q: kill 了本地 run-batch 进程, 但集群上 Flink job 还在跑?**
+A: 正常。run-batch 在本地 mac, Flink job 在集群独立运行, 杀本地进程不停远端 job。手动停: `ssh fa-master "docker exec jobmanager flink list 2>/dev/null | grep -oE '[a-f0-9]{32}' | xargs -I{} docker exec jobmanager flink cancel {}"`, 再删残留 dumper。
 
 ---
 

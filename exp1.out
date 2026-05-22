@@ -1,0 +1,20 @@
+════════════════════════════════════════════════════
+BATCH: exp1  (120 experiments)
+  shuffle: false
+════════════════════════════════════════════════════
+
+──────────────────────────────────────────
+[1/120] synth_abrupt C1 algo=_ p=_ run=1 
+──────────────────────────────────────────
+════════════════════════════════════════════════════
+EXPERIMENT: synth_abrupt_C1_default_p4_r1
+  dataset=synth_abrupt (n=100000, header=true, id=true)
+  config=C1 (pause=USE_OLD_FOREST, warn=DISCARD)
+  parallelism=4  detector=default
+  result → master:/opt/fa-iforest/results/synth_abrupt_C1_default_p4_r1
+════════════════════════════════════════════════════
+
+[1/9] clean topics ...
+=== clean-topics: delete all 6 topics ===
+[delete] source-topic
+Warning: Permanently added '47.120.59.81' (ED25519) to the list of known hosts.
