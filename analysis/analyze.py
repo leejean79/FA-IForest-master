@@ -12,20 +12,20 @@ FA-iForest 统一分析脚本 / Unified analysis script for FA-iForest experimen
 使用示例 / Usage examples:
 
   # 1. 单次漂移分析
-  python analyze.py --mode drift \\
+  python analyze_old.py --mode drift \\
       --scores scores-sudden-old.jsonl \\
       --window 2000 \\
       --driftspec synth_abrupt.driftspec.json \\
       --out drift_report.json
 
   # 2. 批处理 30 次 stationary 实验
-  python analyze.py --mode stationary \\
+  python analyze_old.py --mode stationary \\
       --scores-dir runs/donors/ \\
       --out donors_summary.json \\
       --out-csv donors_summary.csv
 
   # 3. 吞吐 + 业务延迟
-  python analyze.py --mode throughput \\
+  python analyze_old.py --mode throughput \\
       --prometheus http://master:9090 \\
       --start "2026-05-21T09:00:00Z" \\
       --end "2026-05-21T11:00:00Z" \\
@@ -33,7 +33,7 @@ FA-iForest 统一分析脚本 / Unified analysis script for FA-iForest experimen
       --out throughput_report.json
 
   # 4. 可扩展性
-  python analyze.py --mode scalability \\
+  python analyze_old.py --mode scalability \\
       --runs-dir runs/scalability/ \\
       --out scalability.png \\
       --out-csv scalability.csv
@@ -148,51 +148,55 @@ def compute_precision_recall(y_true, scores, threshold):
 
 
 def find_threshold_at_fpr(y_true, scores, target_fpr):
-    """二分查找在 target_fpr 时的阈值. 返回 (阈值, 实际 FPR, FNR)."""
+    """找在 target_fpr 时的阈值. 返回 (阈值, 实际 FPR, FNR).
+
+    向量化版 (一次排序 + searchsorted), 等价于原"升序遍历候选阈值"循环:
+    原循环升序扫候选, 记 |fpr-target| 最小者, 一旦 fpr<=target 即 break.
+    这里用 searchsorted 一次算出所有候选的 fpr/fnr, 再在"首个 fpr<=target"
+    截断范围内取 |fpr-target| 最小. 数值与原逻辑一致, 复杂度 O(n log n).
+    """
     y = np.asarray(y_true)
     s = np.asarray(scores)
-    if (y == 1).sum() == 0 or (y == 0).sum() == 0:
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    if n_pos == 0 or n_neg == 0:
         return None, None, None
-    # 排序所有分数, 用作候选阈值
-    candidates = np.sort(np.unique(s))
-    # 二分: 在阈值升序中找 FPR 最接近 target 的
-    best_t = None
-    best_diff = float("inf")
-    for t in candidates:
-        fpr, fnr = compute_fpr_fnr(y, s, t)
-        if fpr is None:
-            continue
-        diff = abs(fpr - target_fpr)
-        if diff < best_diff:
-            best_diff = diff
-            best_t = t
-            best_fpr = fpr
-            best_fnr = fnr
-        if fpr <= target_fpr:
-            break  # 已经低于目标, 后续阈值更高 FPR 只会更低
-    return (best_t, best_fpr, best_fnr) if best_t is not None else (None, None, None)
+    candidates = np.sort(np.unique(s))         # 升序候选阈值 (同原)
+    neg_sorted = np.sort(s[y == 0])
+    pos_sorted = np.sort(s[y == 1])
+    # compute_fpr_fnr 用 pred = (s >= t): FPR = #(neg >= t)/n_neg
+    #   #(neg >= t) = n_neg - #(neg < t);  searchsorted side="left" = 严格小于
+    fpr_arr = (n_neg - np.searchsorted(neg_sorted, candidates, side="left")) / n_neg
+    # FNR = #(pos < t)/n_pos  (pred=0 即 s<t 的正样本)
+    fnr_arr = np.searchsorted(pos_sorted, candidates, side="left") / n_pos
+    # 原逻辑: 升序遇到首个 fpr<=target 就 break → 在 [0, cutoff] 内找最优
+    le = np.where(fpr_arr <= target_fpr)[0]
+    end = (le[0] + 1) if len(le) > 0 else len(candidates)
+    diffs = np.abs(fpr_arr[:end] - target_fpr)
+    if len(diffs) == 0:
+        return None, None, None
+    k = int(np.argmin(diffs))                  # 同原: 第一个达到最小 diff 的位置
+    return float(candidates[k]), float(fpr_arr[k]), float(fnr_arr[k])
 
 
 def find_optimal_threshold(y_true, scores):
-    """用 Youden's J statistic (TPR - FPR) 找最优阈值."""
+    """用 Youden's J statistic (TPR - FPR) 找最优阈值. 向量化版."""
     y = np.asarray(y_true)
     s = np.asarray(scores)
-    if (y == 1).sum() == 0 or (y == 0).sum() == 0:
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    if n_pos == 0 or n_neg == 0:
         return None, None
-    candidates = np.linspace(s.min(), s.max(), 100)
-    best_t = None
-    best_j = -1
-    for t in candidates:
-        fpr, fnr = compute_fpr_fnr(y, s, t)
-        if fpr is None or fnr is None:
-            continue
-        tpr = 1 - fnr
-        j = tpr - fpr
-        if j > best_j:
-            best_j = j
-            best_t = t
-            best_fpr = fpr
-    return (best_t, best_fpr) if best_t is not None else (None, None)
+    candidates = np.linspace(s.min(), s.max(), 100)   # 同原: 100 个等距候选
+    neg_sorted = np.sort(s[y == 0])
+    pos_sorted = np.sort(s[y == 1])
+    fpr_arr = (n_neg - np.searchsorted(neg_sorted, candidates, side="left")) / n_neg
+    fnr_arr = np.searchsorted(pos_sorted, candidates, side="left") / n_pos
+    tpr_arr = 1 - fnr_arr
+    j_arr = tpr_arr - fpr_arr
+    # 原循环: j > best_j 才更新 → 取第一个最大 J (argmax 返回首个最大值索引, 一致)
+    k = int(np.argmax(j_arr))
+    return float(candidates[k]), float(fpr_arr[k])
 
 
 # ============================================================
@@ -316,7 +320,14 @@ def mode_drift(args):
         else:
             print(f"    定义1: 漂移后未产生新版本 (HDDM 未触发或 COOLDOWN 未完成)")
             delays["definition_1_first_new_version"] = None
-        
+
+        # ===== 向量化预处理: sort by seq + 转 numpy (一次性, 供定义2/3 滑窗用) =====
+        # seq 在 Flink 并行下无序, searchsorted 需有序; AUC/FPR 不依赖行序, sort 不改数值
+        _sorted = df.sort_values("seq")
+        _seq = _sorted["seq"].to_numpy()
+        _label = _sorted["label"].to_numpy()
+        _score = _sorted["score"].to_numpy()
+
         # 定义 2: AUC 回到漂移前 95%
         # 用 1000 条滑动窗口看 AUC 恢复
         win = 1000
@@ -327,11 +338,13 @@ def mode_drift(args):
             print(f"      漂移前 AUC 基线: {baseline_auc:.4f}")
             print(f"      目标: {target:.4f}")
             recovery_seq = None
+
             for start in range(drift_point, n - win, 100):
-                window_df = df[(df["seq"] >= start) & (df["seq"] < start + win)]
-                if len(window_df) < 100:
+                lo = np.searchsorted(_seq, start, side="left")
+                hi = np.searchsorted(_seq, start + win, side="left")
+                if hi - lo < 100:
                     continue
-                w_auc = compute_auc(window_df["label"], window_df["score"])
+                w_auc = compute_auc(_label[lo:hi], _score[lo:hi])
                 if w_auc and w_auc >= target:
                     recovery_seq = start
                     break
@@ -354,11 +367,13 @@ def mode_drift(args):
             print(f"      漂移前 FPR 基线: {pre_fpr*100:.1f}%")
             peak_fpr = 0
             stable_seq = None
+            
             for start in range(drift_point, n - win, 100):
-                window_df = df[(df["seq"] >= start) & (df["seq"] < start + win)]
-                if len(window_df) < 100:
+                lo = np.searchsorted(_seq, start, side="left")
+                hi = np.searchsorted(_seq, start + win, side="left")
+                if hi - lo < 100:
                     continue
-                fpr, _ = compute_fpr_fnr(window_df["label"], window_df["score"], 0.5)
+                fpr, _ = compute_fpr_fnr(_label[lo:hi], _score[lo:hi], 0.5)
                 if fpr is None:
                     continue
                 peak_fpr = max(peak_fpr, fpr)

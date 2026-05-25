@@ -12,7 +12,7 @@
 #   n_samples           样本数 (用来判定实验完成: output-scores offset == n_samples)
 #   dimensions          特征维度 (用来 sanity check)
 #   notes               人类备注
-#   drift_events        (可选) 漂移事件元数据, 给 analyze.py 计算 detection latency
+#   drift_events        (可选) 漂移事件元数据, 给 analyze_old.py 计算 detection latency
 #
 # 注: 实际 CSV 的预处理脚本(异常转换/列对齐) 由 analysis/ 下脚本完成
 #     这里只描述"最终用于实验的 CSV"的格式

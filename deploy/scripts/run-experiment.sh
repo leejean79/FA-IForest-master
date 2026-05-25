@@ -305,7 +305,7 @@ if [[ "${score_lines:-0}" -lt 1 ]]; then
 else
     echo "  scores.jsonl: $score_lines 行"
     # 字段映射: ScoreResult 序列化用 originalSequence/dataPointId,
-    # 但 analyze.py 要 seq/id. 逐行 rename, 不改 Java 也不改 analyze.py.
+    # 但 analyze_old.py 要 seq/id. 逐行 rename, 不改 Java 也不改 analyze_old.py.
     echo "  mapping fields (originalSequence→seq, dataPointId→id) ..."
     ssh_master "python3 - <<'PY'
 import json

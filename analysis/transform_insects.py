@@ -177,7 +177,7 @@ def transform(input_path: Path, output_dir: Path, drift_points: list[int],
         "drift_events": [
             {
                 "type": drift_type,
-                "start_line": d["transformed_line"],    # analyze.py 读这个字段
+                "start_line": d["transformed_line"],    # analyze_old.py 读这个字段
                 "original_line": d["original_line"],    # 保留追溯原始 CSV 行号
             }
             for d in mapped_drifts

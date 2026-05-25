@@ -18,11 +18,27 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_DIR="$(dirname "$SCRIPT_DIR")"
-PROJECT_ROOT="$(dirname "$DEPLOY_DIR")"
+
+# 探测 analyze.py 位置 (脚本放 analysis/ 或 deploy/scripts/ 都能用):
+#   1. 同目录 (analyze-all.sh 和 analyze.py 都在 analysis/)
+#   2. 上一层的 analysis/ (脚本在 deploy/scripts/, analyze.py 在项目根 analysis/)
+#   3. 上两层的 analysis/
+if [[ -f "$SCRIPT_DIR/analyze.py" ]]; then
+    ANALYZE_PY="$SCRIPT_DIR/analyze.py"
+    PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"          # analysis 的上层 = 项目根
+elif [[ -f "$(dirname "$SCRIPT_DIR")/analysis/analyze.py" ]]; then
+    PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+    ANALYZE_PY="$PROJECT_ROOT/analysis/analyze.py"
+elif [[ -f "$(dirname "$(dirname "$SCRIPT_DIR")")/analysis/analyze.py" ]]; then
+    PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+    ANALYZE_PY="$PROJECT_ROOT/analysis/analyze.py"
+else
+    echo "ERROR: 找不到 analyze.py (查找了同目录/上层/上两层的 analysis/)"
+    exit 1
+fi
 
 RESULTS_DIR="$PROJECT_ROOT/results-local"
-ANALYZE="python3 $PROJECT_ROOT/analysis/analyze.py"
+ANALYZE="python $ANALYZE_PY"
 OUT_DIR="$PROJECT_ROOT/analysis-output"
 PLAN_FILTER=""
 
