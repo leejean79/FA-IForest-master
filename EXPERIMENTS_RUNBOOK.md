@@ -135,6 +135,28 @@ bash deploy/scripts/run-experiment.sh \
 
 ## 3. 断点续跑
 
+### 3.1 首先确认没有完成的结果文件，并删除：
+=== master 上操作 ===
+ssh fa-master
+cd /opt/fa-iforest/repo
+
+1. 先看哪些未完成 (dry-run)
+`bash deploy/scripts/clean-failed-results.sh --results-dir /opt/fa-iforest/results`
+    应该列出 11 个 forestcover (r3,8,10,15,18,19,20,25,26,29,30)
+    但 r3 你刚单跑成功了, 现在应该是 10 个
+
+2. 确认无误后删
+`bash deploy/scripts/clean-failed-results.sh --results-dir /opt/fa-iforest/results --delete`
+
+ 3. tmux 重跑 exp2 (断点续跑)
+```tmux new -s exp2
+cd /opt/fa-iforest/repo
+RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp2 2>&1 | tee exp2_retry.out
+ Ctrl+B D 脱离
+exit
+```
+
+
 `run-experiment.sh` 检查结果目录: 如果 `scores.jsonl` 已存在就 **skip**。
 所以批量跑中断后, 直接重跑同一 plan, 已完成的自动跳过:
 
