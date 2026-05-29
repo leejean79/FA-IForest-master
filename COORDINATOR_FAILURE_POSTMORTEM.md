@@ -1,120 +1,186 @@
 # FA-iForest 分布式协调器故障复盘
 # Coordinator Forest-Assembly Failure: A Post-mortem
 
-记录 exp2 批量实验中发现的协调器间歇性失败问题, 从现象到根因的完整排查过程。
-重点在排故方法论, 供日后类似分布式问题参考。
+记录 exp2 批量实验中"协调器无全局森林产出"问题的完整排查过程：从现象、
+一连串被推翻的误诊，到最终坐实的真根因。**本文档此前的根因结论（batchEnd
+触发时机竞态）已被证伪**，本版为更正后的最终复盘。重点在排故方法论与
+"误诊是如何产生、又如何被实测数据逐一打掉"的教训。
+
+> 真根因一句话：**100 棵树组装成的全局 ForestMessage 序列化后约 1.09 MB，
+> 超过 Kafka 单消息默认上限 1 MB（1,048,576 字节），被 broker 拒收
+> （RecordTooLargeException）。** 与并发顺序、seed、数据排列、协调器逻辑均无关。
 
 ---
 
 ## 一、现象 / Symptoms
 
-批量实验 (exp2, 150 个 stationary 数据集实验) 连续运行约一晚, 出现间歇性失败:
+批量实验（exp2，stationary 数据集）运行中出现间歇性失败：
 
-- 前 62 个实验 (donors 30 + http 30 + forestcover 前 2 个) 全部成功
-- 从第 63 个开始出现失败, 且**越往后失败越频繁** (后期连续多个失败)
-- forestcover 数据集 30 次重复中 11 次失败 (失败率 37%), 失败集中在后期 (如 r18-20、r25-26、r29-30 连续失败)
-- donors / http 零失败
+- donors / http（各 30 次）零失败；**forestcover 反复失败**，且看似"随机"
+- 失败实验内部表现高度一致：
+  - 源数据完整写入 source-topic
+  - 各并行子任务正常产出局部 iTree，写入 tree-topic（恰好 100 棵，
+    4 子任务各 25 棵，`(subtask, slot)` 100 个唯一组合，分布均匀，无重复）
+  - tree-topic 的 Coordinator consumer LAG = 0（树全部被消费）
+  - Flink UI 显示 Coordinator Function 算子 Records Received = 100、
+    Records Sent = 0，状态 RUNNING、无 Exception
+  - **model-topic 始终为 0** —— 看似"收齐 100 棵树却没组装出全局森林"
+  - 下游打分算子等不到全局森林 → 不打分 → output-scores = 0 → 超时 JOBFAIL
 
-单个失败实验的内部表现:
-- 数据生产正常: 源数据完整写入 Kafka 源 topic
-- 本地处理正常: 各并行子任务正常产出局部 iTree, 写入树 topic (100 棵树, 4 个子任务各 25 棵, 分布均匀)
-- **协调器无产出**: 模型 topic 始终为空 — 协调器收到了齐全的 100 棵树, 却没有组装出全局森林
-- 下游因此卡死: 打分算子等不到全局森林, 不产出异常分数, 实验在等待阶段超时, 判定失败
-
-关键矛盾: **所有输入都齐备 (100 棵树到位), 但协调器组装环节零输出。**
-
----
-
-## 二、排故思路 / Diagnostic Approach
-
-### 1. 分层定位, 不跳步
-
-把数据流拆成串行环节, 逐段确认数据在哪一环断掉:
-
-```
-源数据生产 → 源 topic → 本地处理 (建树) → 树 topic → 协调器组装 → 模型 topic → 打分 → 输出
-```
-
-逐一查每个 topic 的消息量, 发现断点精确落在「树 topic 有 100 棵, 模型 topic 为 0」之间 —
-即协调器的组装环节。这一步排除了"数据没产生""消费没跟上"等上游可能。
-
-### 2. 不靠猜测, 用证据说话
-
-排查中数次基于直觉提出假设, 但都用实测数据验证, 错了就推翻:
-
-- 假设"数据分发不均, 部分子任务没产树" → 实测树的子任务分布是 {0:25, 1:25, 2:25, 3:25} 完全均匀, **推翻**
-- 假设"TaskManager 崩溃 / slot 不足" → 实测两个 TaskManager 健康, 共 8 槽位有余, **推翻**
-- 假设"数据集特有问题 (forestcover 数据触发)" → 实测失败是**累积性**的 (前 62 个全 OK, 之后渐密), 与数据集本身无关, **推翻**
-
-每次推翻都缩小了范围, 最终锁定在协调器的触发逻辑。
-
-### 3. 抓住"间歇 + 越来越频繁"这个特征
-
-这是定位根因的关键线索。一个稳定复现的 bug 通常是确定性的逻辑错误;
-而"间歇且随运行时长加剧"强烈指向**非确定性因素** (时序、并发顺序、负载相关),
-而非数据或配置问题。这把排查方向从"数据/配置"转向了"并发时序"。
-
-### 4. 读源码定位最终根因
-
-当外部观测 (topic 消息、容器状态、资源指标) 已无法进一步定位时,
-回到协调器的源码, 审查它"何时触发组装"的条件判断, 找到了与时序相关的缺陷。
+**核心矛盾（贯穿整个排查）**：所有输入齐备、算子收满 100 条、却零输出、且无任何
+warn/error。这个矛盾在表层无解——直到拿到完整失败现场日志才揭晓。
 
 ---
 
-## 三、根因 / Root Cause
+## 二、真根因 / Root Cause
 
-协调器的设计: 收集所有并行子任务的局部树, 当**所有预期槽位填满**时, 组装并发出全局森林。
+### 机制
 
-缺陷在**触发时机的判断条件**:
+全局森林 `ForestMessage` 内含 `List<ITreeMessage> trees`（100 棵完整 iTree）。
+在 forestcover（54 维、高维特征）下，该消息 JSON 序列化后约 **1,090,547 字节**，
+超过 Kafka producer 的 `max.request.size` 与 broker 的 `message.max.bytes`
+默认值 **1,048,576 字节（1 MB）**。Kafka 在序列化后、压缩前校验单条 record 大小，
+直接抛 `org.apache.kafka.common.errors.RecordTooLargeException`，消息从未落盘。
 
-协调器原本只在收到带有"批次结束"标记的树时, 才去检查是否已填满所有槽位。
-每个子任务发送固定数量的树, 其中最后一棵带"批次结束"标记。
+```
+Caused by: org.apache.kafka.common.errors.RecordTooLargeException:
+  The message is 1090547 bytes when serialized which is larger than 1048576,
+  which is the value of the max.request.size configuration.
+```
 
-但在分布式流处理中, 多个子任务的树是**乱序到达**协调器的。存在这样的到达顺序:
-所有"批次结束"标记的树都已到达 (此时尚未填满), 而最后补齐槽位的那棵是**普通树
-(无批次结束标记)** — 这种情况下, 补齐的那一刻不会触发检查, 导致协调器
-**永远不组装全局森林**, 一直空等到超时。
+### 为何"forestcover 失败、donors/http 成功"
 
-为何间歇且后期加剧: 树的到达顺序是非确定的, 取决于网络、Kafka 分区调度、节点负载。
-集群空闲时 (运行初期) 到达较有序, "批次结束"树通常最后到, 恰好触发组装, 成功;
-连续运行后负载累积, 到达顺序更易错乱, "批次结束"树先到、普通树后补的概率上升,
-于是失败越来越频繁。这完美解释了"前期全 OK, 后期连续失败"的现象。
+不是 seed、不是数据排列、不是时序竞态，而是**森林体积**：
+forestcover 高维 → 树结构大 → 森林 > 1 MB → 被拒；
+donors/http 低维 → 森林 < 1 MB → 正常落盘。
+这一条解释了从第一天起就观察到的、被误读为"数据集特殊/随机失败"的全部现象。
 
-**一句话**: 组装的触发条件错误地依赖了"批次结束标记"这一特定信号, 而非"槽位是否填满"
-这一真正的判据; 在树乱序到达时, 该信号与填满时机错位, 导致组装永不触发。
+### 为何长期被掩盖、且表现为"随机 + 无报错"
+
+协调器的 model-topic producer 设为 `AT_LEAST_ONCE`，但两个 Job **从未启用
+checkpoint**。Flink 因此把它**强制降级为 NONE 语义**
+（日志 `Switching to NONE semantic`）。NONE 语义下 producer 不等 broker ack、
+不检查发送结果——于是 `RecordTooLargeException` 被**静默吞掉**：
+
+- 协调器每次都成功执行 `out.collect(forest)`，打印 `emitted forest`
+  （组装逻辑完全正确，从不出错）；
+- 但这条消息被 Kafka 拒收，model-topic 保持 0；
+- 算子 Records Sent = 0、日志无 warn/error —— 因为错误在 producer 回调里被吞，
+  没有抛到算子层。
+
+这正是"收满 100、零输出、无报错"这个核心矛盾的来源：**不是没 fire，是 fire 了
+但消息进不去 Kafka，且错误被 NONE 语义隐藏。**
+
+"随机性"的真相：NONE 语义下消息发出后不重试，能否侥幸落盘取决于体积是否越界——
+forestcover 必越界（必失败），donors/http 不越界（必成功）。看似随机，实为确定。
+
+---
+
+## 三、误诊清单 / What We Got Wrong（本复盘的核心价值）
+
+这个问题历经十余轮误诊，每个假设都曾看似合理，又都被实测数据打掉。
+如实记录，供日后避坑：
+
+| # | 误诊假设 | 被什么数据推翻 |
+|---|---|---|
+| 1 | seed 绑定的确定性 bug（r8/r10 反复失败） | 清理后 r8/r10 又能成功，r18 反而失败——小样本巧合 |
+| 2 | batchEnd 触发时机的并发竞态（**前一版复盘的结论**） | 删除该 return 后仍失败；日志证明协调器每次都成功 emit。注：删 return 这个改动**本身是正确的健壮性改进**（fire 应基于"槽位填满"而非"收到 batchEnd 标记"，乱序到达下后者不可靠），予以保留；只是它被误当成根因修复，真正的失败另有其因（消息超限） |
+| 3 | MapState 键碰撞 / 槽位缺失，filledCount < 100 | 探针实测 tree-topic 100 条、100 个唯一 (subtask,slot)、无重复 |
+| 4 | 数据分发不均、某 subtask 少产树 | 实测 {0:25,1:25,2:25,3:25} 均匀 |
+| 5 | 反序列化静默丢弃消息 | 源码 parse 失败会抛异常使 job FAIL，不会静默；LAG=0 |
+| 6 | TaskManager 挂 / slot 不足 | 实测 2 TM 共 8 slot、有余、算子 RUNNING |
+| 7 | 残留多实例并发污染 tree-topic | 清干净（No running jobs）后单跑仍失败 |
+| 8 | from-latest 时序竞态漏掉森林广播 | model-topic 实测为 0——森林根本没写进去，不是没读到 |
+| 9 | 参数不一致致 expectedSlots ≠ 100 | 脚本两边同源 `$PARALLELISM`，expectedSlots=100 正确 |
+| 10 | broker 高负载超时导致写入失败 | broker 日志干净，无 timeout/ISR/选主 |
+| 11 | gzip 一行即可治本（不必改 max.request.size） | 改 gzip 后仍报 RecordTooLarge——`max.request.size` 校验压缩前大小 |
+
+**共同病根**：在不完整或错配的失败现场上推因果（跨 run、跨时刻、跨机器拼凑数据），
+反复"凭直觉猜根因"。每一个假设单独看都合理，但都不是用"同一次失败的完整现场"
+验证出来的。
+
+**终结它的转折点**：销毁重建容器后，卡在失败点当场抓**同一次 run、两台 TM 的
+同步日志 + topic offset**，读到 Kafka 抛出的精确字节数
+（1090547 > 1048576）。真凶到此现形——不是任何一次聪明的推理，是取证纪律。
 
 ---
 
 ## 四、修复 / Fix
 
-将触发检查从"仅在收到批次结束标记时"改为"每收到一棵树都检查是否填满"。
-判据回归本质 — 只要所有预期槽位填满即组装, 无论补齐的最后一棵是否带结束标记。
-配合幂等标记防止重复组装。
+真根因是"单条消息超 Kafka 上限"，需 **producer / broker / consumer 三端 + 副本同步**
+四处上限对齐，外加暴露真错误的 checkpoint 与一个同源的次要问题。
 
-修复后单实验验证: 协调器正常组装全局森林, 模型 topic 有产出, 下游打分恢复,
-实验完整产出全部分数, 不再卡死。
+### 1. 三端 + 副本消息上限调至 5 MB（核心修复）
+
+`max.request.size` 校验的是**压缩前**的序列化大小，gzip 无法绕过，必须显式调大。
+四处缺一不可，任一处未改则消息在该端被拦：
+
+- **Producer**（CoordinatorJob，`producerProps`）：
+  `max.request.size=5242880` + `compression.type=gzip`（gzip 减小实际传输/存储，无害）
+- **Broker 接收**（compose kafka-1 env）：`KAFKA_MESSAGE_MAX_BYTES=5242880`
+- **Broker 副本同步**（compose kafka-1 env）：`KAFKA_REPLICA_FETCH_MAX_BYTES=5242880`
+  （replication≥2 时，follower 需能 fetch 大消息，否则 ISR 收缩）
+- **Consumer**（LocalProcessor，`modelKafkaProps`）：`max.partition.fetch.bytes=5242880`
+
+### 2. 启用 checkpoint（暴露并杜绝静默丢失）
+
+两个 Job 加 `env.enableCheckpointing(10000)`。使 `AT_LEAST_ONCE` 真正生效：
+checkpoint 时 flush 并等待 broker ack，保证单条、低频、关键的森林消息可靠送达，
+不再被 NONE 语义静默吞错。下游对同 version 森林重复送达幂等
+（broadcast state 固定 key 覆盖），AT_LEAST_ONCE 恢复重发无副作用。
+
+> 注：正是 checkpoint 把潜伏的 `RecordTooLargeException` 从"被吞"变为"checkpoint
+> flush 失败 → task FAILED 重启循环"，真凶才暴露。checkpoint 不是制造问题，是揭露问题。
+
+### 3. source consumer 改 setStartFromEarliest（次要、同源问题）
+
+source `kafkaConsumer` 未设 startup 模式，默认回退 latest；producer 抢在 consumer
+订阅完成前灌数据，开头若干条（实测 1243 条）被跳过 → consumer 从非零 offset 起，
+进度永远差一截、卡在 99%。改 earliest 从 offset 0 读全（每 run 销毁重建容器，
+source-topic 每次为空，安全）。与 model-topic 同属"latest 语义 + producer 抢跑"。
+
+### 4. 保留：协调器 fire 判据基于"槽位填满"而非 batchEnd 标记
+
+早先提交 `50a8e3f` 删除了 `if (!msg.isBatchEnd()) return;`，改为每棵树到达都检查
+`filledCount >= expectedSlots`。该改动当时被误当成根因修复（实际未解决问题），
+但其**本身是正确的健壮性改进**——乱序到达的流中，补齐最后一个槽位的树未必带
+batchEnd 标记，依赖该标记触发会漏 fire。当前（删 return 的）版本已被两次成功实验
+验证可用，**予以保留，不应改回**原始的 batchEnd-return 设计。
+
+### 验证
+
+四处修复后连续两次 forestcover r8：无 RecordTooLargeException、无协调器 FAILED 循环、
+有 Completed checkpoint、`emitted forest` 仅一次、**model-topic offset = 1**、
+4 子任务全部 received global forest、source 进度 100%、output-scores 有产出、
+job 正常 FINISH。
 
 ---
 
 ## 五、教训 / Lessons
 
-1. **分布式系统中, 任何"完成判定"都不应依赖消息到达顺序。**
-   触发条件应基于"状态是否满足" (槽位填满), 而非"是否收到某个特定信号" (结束标记)。
-   流处理中消息乱序是常态, 把顺序假设写进逻辑迟早出问题。
+1. **"组件收到了输入却零输出且无报错" → 怀疑下游 I/O 边界，而非组件内部逻辑。**
+   本案协调器逻辑自始至终正确，问题在它向 Kafka 写出的那一跳。我们却花了十余轮
+   在组装逻辑里找不存在的 bug。Records Received=100 / Sent=0 / 无 Exception 这组
+   信号，早就该指向"sink 写出失败"而非"算子没触发"。
 
-2. **间歇性、随运行时长加剧的故障, 优先怀疑并发时序而非数据/配置。**
-   这类特征是非确定性 bug 的指纹。若一开始就盯着"forestcover 数据有什么特殊",
-   会南辕北辙 — 实际与数据无关, 是并发顺序在作祟。
+2. **弱可靠性语义会把硬错误伪装成随机故障。** NONE 语义吞掉 `RecordTooLargeException`，
+   使一个**确定性**的体积越界问题表现为"间歇随机失败"。看到"随机 + 无报错"，
+   要警惕是不是错误被某层静默吞了，而非真的非确定。
 
-3. **排故先分层定位断点, 再逐个用实测推翻假设。**
-   先确定数据在哪一环断 (树 topic 有、模型 topic 无), 把范围缩到协调器;
-   再对每个假设取实测数据 (子任务分布、资源、累积性) 逐一证伪。
-   猜测不验证会浪费时间在错误方向上。
+3. **"间歇 + 越来越频繁"不必然是并发时序。** 前一版复盘据此断言并发竞态——错了。
+   本案的"随机"实为"按数据集体积确定"，"后期加剧"实为"后期 forestcover 占比高"。
+   时序假设是最诱人的误诊方向之一，必须用实测证伪而非凭特征下结论。
 
-4. **外部观测到极限后, 回到源码读触发逻辑。**
-   topic 消息量、容器状态、资源指标能定位到"哪个组件", 但定位"为什么"
-   往往需要审查该组件的判断条件。
+4. **诊断分布式问题，必须抓"同一次失败、同步、完整"的现场。** 跨 run / 跨时刻 /
+   跨机器拼凑数据是本案十余轮弯路的总病根。决定性证据来自一次"销毁重建 → 卡在
+   失败点 → 同时抓两台 TM 日志 + topic offset"的同步取证，一次读到真相。
 
-5. **批量长时运行是暴露并发 bug 的有效手段。**
-   单次实验 (尤其小数据) 可能恰好顺序正常而不触发; 连续大批量运行放大了
-   时序错乱的概率, 让隐藏的顺序依赖缺陷显形。压测的价值正在于此。
+5. **读到 Kafka/框架抛出的精确报错，胜过任何推理。** 真根因不是推出来的，是
+   `RecordTooLargeException: 1090547 > 1048576` 这行日志直接给的。外部观测到极限时，
+   答案往往就在那条一直没被完整读到的异常堆栈里。
+
+6. **关于 Kafka 消息上限的具体事实**（排查中曾误判，记录备查）：
+   `max.request.size` 校验**压缩前**大小，gzip 绕不过；需 producer、broker
+   `message.max.bytes`、broker `replica.fetch.max.bytes`、consumer
+   `max.partition.fetch.bytes` 四处一致调大。大对象（如整片模型）不宜整条塞进
+   单个 Kafka 消息，长远应考虑分片或外部存储 + 指针广播。

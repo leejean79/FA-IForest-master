@@ -162,6 +162,8 @@ public class LocalProcessor {
         env.setParallelism(parallelism);
         env.setMaxParallelism(maxParallelism);
         env.getConfig().setGlobalJobParameters(params);
+        env.enableCheckpointing(10000);  // 开启 checkpoint，使 AT_LEAST_ONCE Producer 在 checkpoint 时 flush+等 ack，确保单条森林可靠落盘
+
 
         // 配置 Kafka 属性 / Configure Kafka properties
         Properties kafkaProps = new Properties();
@@ -176,6 +178,8 @@ public class LocalProcessor {
                 new SimpleStringSchema(),
                 kafkaProps
         );
+
+        kafkaConsumer.setStartFromEarliest();  // 从头消费 source-topic，避免 producer 抢跑导致漏掉开头数据
 
         DataStream<String> rawStream = env.addSource(kafkaConsumer)
                 .assignTimestampsAndWatermarks(
@@ -205,13 +209,15 @@ public class LocalProcessor {
         Properties modelKafkaProps = new Properties();
         modelKafkaProps.setProperty("bootstrap.servers", brokers);
         modelKafkaProps.setProperty("group.id", "model-consumer-" + UUID.randomUUID().toString().substring(0, 8));
+        modelKafkaProps.setProperty("max.partition.fetch.bytes", "5242880");
 
         FlinkKafkaConsumer<String> modelConsumer = new FlinkKafkaConsumer<>(
                 modelTopic,
                 new SimpleStringSchema(),
                 modelKafkaProps
         );
-        modelConsumer.setStartFromLatest();  // 不消费历史森林 / skip historical forests
+//        modelConsumer.setStartFromLatest();  // 不消费历史森林 / skip historical forests
+        modelConsumer.setStartFromEarliest();
 
         DataStream<BroadcastEnvelope> forestEnvelopeStream = env
                 .addSource(modelConsumer)
@@ -232,7 +238,8 @@ public class LocalProcessor {
                 new SimpleStringSchema(),
                 driftRoundKafkaProps
         );
-        driftRoundConsumer.setStartFromLatest();
+//        driftRoundConsumer.setStartFromLatest();
+        driftRoundConsumer.setStartFromEarliest();
 
         DataStream<BroadcastEnvelope> driftRoundEnvelopeStream = env
                 .addSource(driftRoundConsumer)

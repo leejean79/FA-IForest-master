@@ -152,6 +152,8 @@ echo ""
 echo "[3/9] start dumper ..."
 ssh_master "mkdir -p $RESULT_DIR && chmod 777 $RESULT_DIR"
 DUMPER_NAME="dumper-$EXP_ID"
+# 防御: 清掉同名残留容器 (上次失败可能没 cleanup, 同名冲突会让 docker run 失败)
+ssh_master "docker rm -f $DUMPER_NAME >/dev/null 2>&1" || true
 # 30s idle timeout: 给 Phase B 训树留时间
 ssh_master "docker run -d --name $DUMPER_NAME --network host --user root \
     -v $RESULT_DIR:/out \
