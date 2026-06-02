@@ -358,11 +358,22 @@ public class LocalProcessorFunction
                 handleLocalDriftReported(point, score, currentForestVersion, ingestionTime, ctx, out);
                 break;
             case COOLDOWN:
-                out.collect(buildScoreResult(point, score, currentForestVersion, "C", ingestionTime));
+                // v3.4.7: BACKLOG 模式下数据进 backlog 等新森林处理，与 LOCAL_DRIFT_REPORTED 语义一致
+                // BACKLOG_THEN_NEW_FOREST: defer to backlog, awaiting new-forest scoring
+                if (pauseMode == PauseMode.USE_OLD_FOREST) {
+                    out.collect(buildScoreResult(point, score, currentForestVersion, "C", ingestionTime));
+                } else {
+                    backlog.add(point);
+                }
                 handleCooldown(point, score, ctx, out);
                 break;
             case WAITING:
-                out.collect(buildScoreResult(point, score, currentForestVersion, "C", ingestionTime));
+                // v3.4.7: BACKLOG 模式下数据进 backlog 等新森林处理
+                if (pauseMode == PauseMode.USE_OLD_FOREST) {
+                    out.collect(buildScoreResult(point, score, currentForestVersion, "C", ingestionTime));
+                } else {
+                    backlog.add(point);
+                }
                 handleWaiting(currentForestVersion, det, forest, out);
                 break;
         }
