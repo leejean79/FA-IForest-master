@@ -65,6 +65,7 @@ fi
 algo_tag="${ALGORITHM:-default}"; [[ "$algo_tag" == "_" ]] && algo_tag="default"
 EXP_ID="${DATASET}_${CONFIG_ID}_${algo_tag}_p${PARALLELISM}_r${RUN_ID}"
 [[ -n "$EXTRA_PARAM" ]] && EXP_ID="${EXP_ID}_${EXTRA_PARAM//=/-}"
+[[ -n "$EXTRA_PARAM" ]] && EXP_ID="${EXP_ID//;/_}"   # 新增:多参数配对的分号换下划线
 
 # ---------- 连接配置 ----------
 # RUN_MODE: remote (mac 上, ssh 进集群, 默认) | local (master 上, 本地执行)
@@ -214,8 +215,11 @@ LOCAL_ARGS="--broker $BROKERS --topic $TOPIC_SOURCE \
 [[ -n "$DETECTOR" ]] && LOCAL_ARGS="$LOCAL_ARGS --detector $DETECTOR"
 # sensitivity: extra-param 形如 ringBufferSize=512 → --ringBufferSize 512
 if [[ -n "$EXTRA_PARAM" ]]; then
-    k="${EXTRA_PARAM%%=*}"; v="${EXTRA_PARAM##*=}"
-    LOCAL_ARGS="$LOCAL_ARGS --$k $v"
+    IFS=';' read -ra PAIRS <<< "$EXTRA_PARAM"
+    for pair in "${PAIRS[@]}"; do
+        k="${pair%%=*}"; v="${pair##*=}"
+        LOCAL_ARGS="$LOCAL_ARGS --$k $v"
+    done
 fi
 
 LOCAL_OUT=$(ssh_master "docker exec jobmanager flink run -d \
