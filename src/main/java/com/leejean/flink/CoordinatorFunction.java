@@ -53,6 +53,7 @@ public class CoordinatorFunction
     // key = (subtask, slot), value = ITreeMessage
     private transient MapState<Tuple2<Integer, Integer>, ITreeMessage> trees;
     private transient ValueState<Long> currentVersion;
+//    dirty 标记防重复 fire（fire 后置 false，下次有新树才再 fire）
     private transient ValueState<Boolean> dirty;
 
     @Override
@@ -94,9 +95,9 @@ public class CoordinatorFunction
         dirty.update(true);
 
         // v3.3: 只在 batchEnd=true 时考虑触发 / only consider firing on batchEnd=true
-        if (!msg.isBatchEnd()) {
-            return;
-        }
+//        if (!msg.isBatchEnd()) {
+//            return;
+//        }
 
         // 检查是否所有位置都填齐 / check if all slots are filled
         int filledCount = 0;

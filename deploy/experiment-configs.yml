@@ -96,3 +96,15 @@ plans:
       hddmWindowSize: [1000, 2000, 4000]
       cooldownSamples: [1000, 2000, 5000]
     repeats: 3
+
+  # 敏感性测试：HDDM 置信度参数（成对放宽倍率扫描）
+  # 基线 + 10× / 20× / 40× 放宽，看 stable 假阳率随阈值放宽如何变化
+  sensitivity_hddm_conf:
+    dataset: insects_abrupt_imbalanced
+    config: C4
+    configurations:
+      - { warnConfidence: 0.005, driftConfidence: 0.001 }   # 基线
+      - { warnConfidence: 0.05,  driftConfidence: 0.01  }   # 10×
+      - { warnConfidence: 0.1,   driftConfidence: 0.02  }   # 20×
+      - { warnConfidence: 0.2,   driftConfidence: 0.04  }   # 40× 上限对照
+    repeats: 3

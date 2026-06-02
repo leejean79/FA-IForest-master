@@ -112,6 +112,9 @@ def expand_plan(plan_name):
     if "grids" in plan:
         return expand_sensitivity(plan)
 
+    if "configurations" in plan:
+        return expand_configurations(plan)
+
     lines = []
     for ds in datasets:
         for cfg in configs:
@@ -135,6 +138,21 @@ def expand_sensitivity(plan):
             for r in range(1, repeats + 1):
                 # 格式: dataset config _ _ run param=value
                 lines.append(f"{ds} {cfg} _ _ {r} {param}={v}")
+    return lines
+
+def expand_configurations(plan):
+    """sensitivity plan (点列表版): 每个 configuration 是一组 (k=v, ...) 配对,
+    所有参数一起传给一次实验; 与 OAT 的 expand_sensitivity 不同, 这里点之间独立。"""
+    ds = plan["dataset"]
+    cfg = plan["config"]
+    repeats = plan.get("repeats", 1)
+    confs = plan["configurations"]   # list of dicts
+    lines = []
+    for conf in confs:
+        # 把 dict 拼成 "k1=v1;k2=v2", 多对参数用分号分隔
+        extra = ";".join(f"{k}={v}" for k, v in conf.items())
+        for r in range(1, repeats + 1):
+            lines.append(f"{ds} {cfg} _ _ {r} {extra}")
     return lines
 
 

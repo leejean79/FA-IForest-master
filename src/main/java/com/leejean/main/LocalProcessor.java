@@ -61,7 +61,7 @@ import java.util.UUID;
  *   --detector HDDM_A_Windowed --hddmWindowSize 2000
  *   --warnConfidence 0.005 --driftConfidence 0.001
  *   --warnTimeoutSamples 2000 --warnTimeoutBehavior DISCARD
- *   --cooldownSamples 5000 --pNormalStable 0.3 --pNormalWarn 0.1 --zThresholdK 1.0
+ *   --cooldownSamples 5000 --zThresholdK 1.0
  *
  * 参数说明 / Parameters:
  *   --broker               Kafka broker 地址，默认 localhost:9092
@@ -85,8 +85,6 @@ import java.util.UUID;
  *   --warnTimeoutSamples    WARN 超时样本数，默认 2000
  *   --warnTimeoutBehavior   WARN 超时行为：DISCARD|PROMOTE，默认 DISCARD
  *   --cooldownSamples       COOLDOWN 期采集样本数，默认 5000
- *   --pNormalStable         STABLE 期正常数据写入环形缓冲概率，默认 0.3
- *   --pNormalWarn           WARN 期正常数据写入环形缓冲概率，默认 0.1
  *   --zThresholdK           COOLDOWN 期 z-score 阈值系数 k，默认 1.0
  */
 public class LocalProcessor {
@@ -119,8 +117,6 @@ public class LocalProcessor {
         long warnTimeoutSamples = params.getLong("warnTimeoutSamples", hddmDefaults.getWarnTimeoutSamples());
         String warnTimeoutBehavior = params.get("warnTimeoutBehavior", "DISCARD");
         int cooldownSamples = params.getInt("cooldownSamples", 2000);
-        double pNormalStable = params.getDouble("pNormalStable", 0.3);
-        double pNormalWarn = params.getDouble("pNormalWarn", 0.1);
         double zThresholdK = params.getDouble("zThresholdK", 1.0);
 
         int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
@@ -152,8 +148,6 @@ public class LocalProcessor {
         System.out.println("Warn timeout samples: " + warnTimeoutSamples);
         System.out.println("Warn timeout behavior: " + warnTimeoutBehavior);
         System.out.println("Cooldown samples: " + cooldownSamples);
-        System.out.println("P(normal) stable: " + pNormalStable);
-        System.out.println("P(normal) warn: " + pNormalWarn);
         System.out.println("Z-threshold k: " + zThresholdK);
         System.out.println("========================================");
 
@@ -162,6 +156,8 @@ public class LocalProcessor {
         env.setParallelism(parallelism);
         env.setMaxParallelism(maxParallelism);
         env.getConfig().setGlobalJobParameters(params);
+        env.enableCheckpointing(10000);  // 开启 checkpoint，使 AT_LEAST_ONCE Producer 在 checkpoint 时 flush+等 ack，确保单条森林可靠落盘
+
 
         // 配置 Kafka 属性 / Configure Kafka properties
         Properties kafkaProps = new Properties();
@@ -176,6 +172,8 @@ public class LocalProcessor {
                 new SimpleStringSchema(),
                 kafkaProps
         );
+
+        kafkaConsumer.setStartFromEarliest();  // 从头消费 source-topic，避免 producer 抢跑导致漏掉开头数据
 
         DataStream<String> rawStream = env.addSource(kafkaConsumer)
                 .assignTimestampsAndWatermarks(
@@ -205,13 +203,15 @@ public class LocalProcessor {
         Properties modelKafkaProps = new Properties();
         modelKafkaProps.setProperty("bootstrap.servers", brokers);
         modelKafkaProps.setProperty("group.id", "model-consumer-" + UUID.randomUUID().toString().substring(0, 8));
+        modelKafkaProps.setProperty("max.partition.fetch.bytes", "5242880");
 
         FlinkKafkaConsumer<String> modelConsumer = new FlinkKafkaConsumer<>(
                 modelTopic,
                 new SimpleStringSchema(),
                 modelKafkaProps
         );
-        modelConsumer.setStartFromLatest();  // 不消费历史森林 / skip historical forests
+//        modelConsumer.setStartFromLatest();  // 不消费历史森林 / skip historical forests
+        modelConsumer.setStartFromEarliest();
 
         DataStream<BroadcastEnvelope> forestEnvelopeStream = env
                 .addSource(modelConsumer)
@@ -232,7 +232,8 @@ public class LocalProcessor {
                 new SimpleStringSchema(),
                 driftRoundKafkaProps
         );
-        driftRoundConsumer.setStartFromLatest();
+//        driftRoundConsumer.setStartFromLatest();
+        driftRoundConsumer.setStartFromEarliest();
 
         DataStream<BroadcastEnvelope> driftRoundEnvelopeStream = env
                 .addSource(driftRoundConsumer)

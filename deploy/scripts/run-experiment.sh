@@ -65,6 +65,7 @@ fi
 algo_tag="${ALGORITHM:-default}"; [[ "$algo_tag" == "_" ]] && algo_tag="default"
 EXP_ID="${DATASET}_${CONFIG_ID}_${algo_tag}_p${PARALLELISM}_r${RUN_ID}"
 [[ -n "$EXTRA_PARAM" ]] && EXP_ID="${EXP_ID}_${EXTRA_PARAM//=/-}"
+[[ -n "$EXTRA_PARAM" ]] && EXP_ID="${EXP_ID//;/_}"   # 新增:多参数配对的分号换下划线
 
 # ---------- 连接配置 ----------
 # RUN_MODE: remote (mac 上, ssh 进集群, 默认) | local (master 上, 本地执行)
@@ -152,6 +153,8 @@ echo ""
 echo "[3/9] start dumper ..."
 ssh_master "mkdir -p $RESULT_DIR && chmod 777 $RESULT_DIR"
 DUMPER_NAME="dumper-$EXP_ID"
+# 防御: 清掉同名残留容器 (上次失败可能没 cleanup, 同名冲突会让 docker run 失败)
+ssh_master "docker rm -f $DUMPER_NAME >/dev/null 2>&1" || true
 # 30s idle timeout: 给 Phase B 训树留时间
 ssh_master "docker run -d --name $DUMPER_NAME --network host --user root \
     -v $RESULT_DIR:/out \
@@ -212,8 +215,11 @@ LOCAL_ARGS="--broker $BROKERS --topic $TOPIC_SOURCE \
 [[ -n "$DETECTOR" ]] && LOCAL_ARGS="$LOCAL_ARGS --detector $DETECTOR"
 # sensitivity: extra-param 形如 ringBufferSize=512 → --ringBufferSize 512
 if [[ -n "$EXTRA_PARAM" ]]; then
-    k="${EXTRA_PARAM%%=*}"; v="${EXTRA_PARAM##*=}"
-    LOCAL_ARGS="$LOCAL_ARGS --$k $v"
+    IFS=';' read -ra PAIRS <<< "$EXTRA_PARAM"
+    for pair in "${PAIRS[@]}"; do
+        k="${pair%%=*}"; v="${pair##*=}"
+        LOCAL_ARGS="$LOCAL_ARGS --$k $v"
+    done
 fi
 
 LOCAL_OUT=$(ssh_master "docker exec jobmanager flink run -d \

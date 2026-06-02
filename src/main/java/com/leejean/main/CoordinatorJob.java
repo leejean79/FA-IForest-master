@@ -81,6 +81,8 @@ public class CoordinatorJob {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         // 协调器始终 parallelism=1 / coordinator always runs at parallelism=1
         env.setParallelism(1);
+        env.enableCheckpointing(10000);  // 开启 checkpoint，使 AT_LEAST_ONCE Producer 在 checkpoint 时 flush+等 ack，确保单条森林可靠落盘
+
 
         // ===== Source: 订阅 tree-topic =====
         Properties consumerProps = new Properties();
@@ -107,6 +109,8 @@ public class CoordinatorJob {
         // ===== Sink: 发到 model-topic =====
         Properties producerProps = new Properties();
         producerProps.setProperty("bootstrap.servers", brokers);
+        producerProps.setProperty("max.request.size", "5242880");
+        producerProps.setProperty("compression.type", "gzip");
 
         FlinkKafkaProducer<ForestMessage> modelProducer = new FlinkKafkaProducer<>(
                 modelTopic,
