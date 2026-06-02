@@ -78,8 +78,9 @@ import java.util.UUID;
  *   --ringBufferSize        环形缓冲区大小，默认 1000
  *   --parallelism           并行度，默认 4
  *   --seed                  可选，固定随机种子
- *   --detector              漂移检测器类型：HDDM_A_Windowed（默认）| HDDM_A
+ *   --detector              漂移检测器类型：HDDM_A_Windowed（默认）| HDDM_A | HDDM_W
  *   --hddmWindowSize        HDDM_A_Windowed 窗口大小，默认 2000
+ *   --hddmLambda            HDDM_W 的 EWMA 遗忘因子，范围 (0, 1]，默认 0.1
  *   --warnConfidence        HDDM WARN 置信度，默认 0.005
  *   --driftConfidence       HDDM DRIFT 置信度，默认 0.001
  *   --warnTimeoutSamples    WARN 超时样本数，默认 2000
