@@ -33,7 +33,6 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -116,10 +115,7 @@ public class LocalProcessorFunction
     private transient String detectorType;
     private transient int hddmWindowSize;
     private transient int cooldownSamples;
-    private transient double pNormalStable;
-    private transient double pNormalWarn;
     private transient double zThresholdK;
-    private static final double NORMAL_SCORE_THRESHOLD = 0.5;
 
     // v3.4 配置 / v3.4 configuration
     private transient PauseMode pauseMode;
@@ -198,8 +194,6 @@ public class LocalProcessorFunction
         detectorType = params.get("detector", "HDDM_A_Windowed");
         hddmWindowSize = params.getInt("hddmWindowSize", 2000);
         cooldownSamples = params.getInt("cooldownSamples", 2000);
-        pNormalStable = params.getDouble("pNormalStable", 0.3);
-        pNormalWarn = params.getDouble("pNormalWarn", 0.1);
         zThresholdK = params.getDouble("zThresholdK", 1.0);
 
         // v3.4 pause mode
@@ -382,10 +376,10 @@ public class LocalProcessorFunction
                               ReadOnlyContext ctx) throws Exception {
         DriftStatus status = det.update(score);
 
-        // 概率写入环形缓冲 / probabilistic ring buffer write
-        if (score < NORMAL_SCORE_THRESHOLD && ThreadLocalRandom.current().nextDouble() < pNormalStable) {
-            writeToRingBuffer(point);
-        }
+        // v3.4.7: STABLE 期不再写入环形缓冲。
+        // v2 训练池由 COOLDOWN 期 z-score 过滤后的样本独占，避免被旧概念稀释。
+        // v3.4.7: STABLE no longer writes to the ring buffer; the v2 training pool is
+        // owned exclusively by z-score-filtered samples in COOLDOWN, avoiding dilution.
 
         if (status == DriftStatus.WARN) {
             subState.update(PhaseCSubState.WARN);
@@ -403,10 +397,8 @@ public class LocalProcessorFunction
                             ReadOnlyContext ctx) throws Exception {
         DriftStatus status = det.update(score);
 
-        // WARN 期更严格的概率写入 / stricter probabilistic write during WARN
-        if (score < NORMAL_SCORE_THRESHOLD && ThreadLocalRandom.current().nextDouble() < pNormalWarn) {
-            writeToRingBuffer(point);
-        }
+        // v3.4.7: WARN 期也不再写入环形缓冲。
+        // v3.4.7: WARN no longer writes to the ring buffer (see handleStable rationale).
 
         if (status == DriftStatus.DRIFT) {
             // v3.4: DRIFT → LOCAL_DRIFT_REPORTED
