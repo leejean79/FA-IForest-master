@@ -91,6 +91,9 @@ public class LocalProcessorFunction
     private transient ValueState<Long> cooldownN;        // COOLDOWN 期内样本数
     private transient ValueState<Double> cooldownMean;   // Welford mean
     private transient ValueState<Double> cooldownM2;     // Welford M2
+    // v3.4.7: COOLDOWN 期实际写入 ringBuffer 的次数（与 cooldownN 解耦）
+    // v3.4.7: ringBuffer write count during COOLDOWN (decoupled from cooldownN)
+    private transient ValueState<Long> cooldownWrites;
 
     // v3.3 批次版本号 / v3.3 batch version counter
     private transient ValueState<Long> driftRoundCount;
@@ -147,6 +150,9 @@ public class LocalProcessorFunction
                 new ValueStateDescriptor<>("cooldown-mean", Types.DOUBLE));
         cooldownM2 = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("cooldown-m2", Types.DOUBLE));
+        // v3.4.7
+        cooldownWrites = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("cooldown-writes", Types.LONG));
 
         // v3.3 batch version
         driftRoundCount = getRuntimeContext().getState(
@@ -445,6 +451,8 @@ public class LocalProcessorFunction
         if (cMean == null) cMean = 0.0;
         Double cM2 = cooldownM2.value();
         if (cM2 == null) cM2 = 0.0;
+        Long cWrites = cooldownWrites.value();
+        if (cWrites == null) cWrites = 0L;
 
         double delta = score - cMean;
         cMean += delta / cN;
@@ -456,19 +464,41 @@ public class LocalProcessorFunction
         cooldownM2.update(cM2);
 
         // z-score 阈值写入环形缓冲 / z-score threshold ring buffer write
+        boolean written = false;
         if (cN >= 50) {
             double std = Math.sqrt(cM2 / (cN - 1));
             double threshold = cMean + zThresholdK * std;
             if (score < threshold) {
                 writeToRingBuffer(point);
+                written = true;
             }
         } else {
             // 前 50 条全部写入（初始化）/ first 50 all written (initialization)
             writeToRingBuffer(point);
+            written = true;
         }
 
-        // 检查 COOLDOWN 是否结束 / check if COOLDOWN is done
-        if (cN >= cooldownSamples) {
+        // v3.4.7: 维护写入计数 / track actual ringBuffer writes
+        if (written) {
+            cWrites += 1;
+            cooldownWrites.update(cWrites);
+        }
+
+        // v3.4.7: 双终止条件 / dual termination condition
+        // (1) 正常：ringBuffer 已被新数据完全覆盖 AND 至少经过 cooldownSamples 条
+        // (2) 兜底：经过 cooldownSamples*2 条仍未写满（z-score 严格场景）
+        // (1) normal: ringBuffer fully overwritten AND at least cooldownSamples observed
+        // (2) fallback: 2x cooldownSamples observed but ringBuffer still not full
+        boolean fillCondition = (cWrites >= ringBufferSize) && (cN >= cooldownSamples);
+        boolean fallbackCondition = (cN >= (long) cooldownSamples * 2L);
+
+        if (fillCondition) {
+            LOG.info("subtask={}: COOLDOWN done normally, cN={}, writes={}",
+                    subtaskIndex, cN, cWrites);
+            retrainAndEnterWaiting(ctx);
+        } else if (fallbackCondition) {
+            LOG.warn("subtask={}: COOLDOWN forced training, cN={} writes={} (only {}/{} ringBuffer filled)",
+                    subtaskIndex, cN, cWrites, cWrites, ringBufferSize);
             retrainAndEnterWaiting(ctx);
         }
     }
@@ -636,6 +666,7 @@ public class LocalProcessorFunction
         cooldownN.update(0L);
         cooldownMean.update(0.0);
         cooldownM2.update(0.0);
+        cooldownWrites.update(0L);   // v3.4.7
         LOG.info("subtask={}: entered COOLDOWN", subtaskIndex);
     }
 
@@ -692,6 +723,7 @@ public class LocalProcessorFunction
         cooldownN.clear();
         cooldownMean.clear();
         cooldownM2.clear();
+        cooldownWrites.clear();   // v3.4.7
 
         LOG.info("subtask={}: entering WAITING (waiting for version > {})",
                 subtaskIndex, currentForestVersion);
