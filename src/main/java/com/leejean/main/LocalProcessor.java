@@ -113,6 +113,7 @@ public class LocalProcessor {
         HDDM_AConfig hddmDefaults = HDDM_AConfig.defaults();
         String detector = params.get("detector", "HDDM_A_Windowed");
         int hddmWindowSize = params.getInt("hddmWindowSize", 2000);
+        double hddmLambda = params.getDouble("hddmLambda", 0.1);
         double warnConfidence = params.getDouble("warnConfidence", hddmDefaults.getWarnConfidence());
         double driftConfidence = params.getDouble("driftConfidence", hddmDefaults.getDriftConfidence());
         long warnTimeoutSamples = params.getLong("warnTimeoutSamples", hddmDefaults.getWarnTimeoutSamples());
@@ -144,6 +145,7 @@ public class LocalProcessor {
         System.out.println("--- v3.2 HDDM + COOLDOWN ---");
         System.out.println("Detector: " + detector);
         System.out.println("HDDM window size: " + hddmWindowSize);
+        System.out.println("HDDM lambda: " + hddmLambda);
         System.out.println("Warn confidence: " + warnConfidence);
         System.out.println("Drift confidence: " + driftConfidence);
         System.out.println("Warn timeout samples: " + warnTimeoutSamples);
