@@ -35,8 +35,8 @@ algorithms:
     detector: HDDM_A_Windowed        # 已实现 ✅
   HDDM_A_Cumulative:
     detector: HDDM_A                 # 已实现 ✅ (累积版, 非窗口)
-  # HDDM_W:
-  #   detector: HDDM_W_Windowed       # ❌ 未实现
+  HDDM_W:
+    detector: HDDM_W
   # IKS:
   #   detector: IKS                   # ❌ 未实现
 
@@ -61,6 +61,23 @@ plans:
       - insects_gradual_imbalanced
     configs: [C1, C2, C3, C4]
     repeats: 5
+
+  # 实验 1 的 HDDM_W 算法版 (与 exp1 同样的 datasets/configs/repeats, 只切换算法)
+  # 跑完后可与 exp1 (HDDM_A_Windowed 默认) 的结果做算法对比
+  # plan_extras: 整个 plan 共用的额外参数, 注入到每行 extra 列 → run-experiment 翻译为 --hddmLambda 0.1
+  exp1_hddm_w:
+    datasets:
+      - synth_abrupt
+      - synth_gradual
+      - synth_incremental
+      - synth_reoccurring
+      - insects_abrupt_imbalanced
+      - insects_gradual_imbalanced
+    configs: [C1, C2, C3, C4]
+    algorithms: [HDDM_W]
+    repeats: 5
+    plan_extras:
+      hddmLambda: 0.1
 
   # 实验 2: stationary AUC (5 数据集 x 30 shuffle = 150)
   # 注: 用 C1 (代码默认配置), 每次 shuffle 用不同 seed

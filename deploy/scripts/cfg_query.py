@@ -107,6 +107,10 @@ def expand_plan(plan_name):
     algorithms = plan.get("algorithms", ["_"])           # _ = 不指定算法 (用 default)
     parallelism_grid = plan.get("parallelism_grid", ["_"])  # _ = 用 .env 默认
     repeats = plan.get("repeats", 1)
+    # plan_extras: 整个 plan 共用的额外参数 (k=v 字典), 比如 {hddmLambda: 0.1}
+    # 注入到每行的 extra 列, 由 run-experiment.sh 翻译成 --k v 透传给 LocalProcessor
+    plan_extras = plan.get("plan_extras", {})
+    extras_str = ";".join(f"{k}={v}" for k, v in plan_extras.items())
 
     # sensitivity 类型的 plan 特殊处理 (单数据集, 扫参数网格)
     if "grids" in plan:
@@ -121,7 +125,10 @@ def expand_plan(plan_name):
             for algo in algorithms:
                 for par in parallelism_grid:
                     for r in range(1, repeats + 1):
-                        lines.append(f"{ds} {cfg} {algo} {par} {r}")
+                        line = f"{ds} {cfg} {algo} {par} {r}"
+                        if extras_str:
+                            line += f" {extras_str}"
+                        lines.append(line)
     return lines
 
 
