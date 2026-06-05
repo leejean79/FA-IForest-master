@@ -253,7 +253,11 @@ def mode_drift(args):
         drift_point = args.drift_point
     
     if drift_point is not None:
-        print(f"\n[3] 漂移点 seq={drift_point} 前后对比")
+        if len(drift_events) > 1:
+            print(f"\n[3] 漂移点 seq={drift_point} 前后对比 (单点参考: 仅反映第 1 次漂移; "
+                  f"完整多漂移分析见 [5])")
+        else:
+            print(f"\n[3] 漂移点 seq={drift_point} 前后对比")
         print(f"    {'segment':<30} {'n':>6} {'AUC':>8} {'FPR':>8} {'FNR':>8} "
               f"{'opt_t':>6} {'opt_FPR':>8}")
         
@@ -301,97 +305,123 @@ def mode_drift(args):
             threshold_at_5pct[label] = {"threshold": t, "fpr": fpr, "fnr": fnr}
         result["threshold_at_5pct_fpr"] = threshold_at_5pct
         
-        # [5] 漂移响应延迟
-        print(f"\n[5] 漂移响应延迟 (从 seq={drift_point})")
-        delays = {}
-        
-        # 定义 1: 首次新版本出现
-        non_v1 = df[(df["seq"] >= drift_point) & (df["forestVersion"] > 1)]
-        if len(non_v1) > 0:
-            first_new = int(non_v1["seq"].min())
-            delay_1 = first_new - drift_point
-            print(f"    定义1 (首次新版本出现)")
-            print(f"      首次非 v1 数据 @ seq={first_new}")
-            print(f"      -> 延迟: {delay_1} 条数据")
-            delays["definition_1_first_new_version"] = {
-                "first_new_version_seq": first_new,
-                "delay_records": delay_1,
-            }
-        else:
-            print(f"    定义1: 漂移后未产生新版本 (HDDM 未触发或 COOLDOWN 未完成)")
-            delays["definition_1_first_new_version"] = None
+        # [5] 漂移响应延迟 (多漂移点支持: 对 drift_events 中每个点分别算 def1/2/3)
+        # 单漂移退化: drift_events 只有 1 项时, 每个 list 仅含 1 个元素, 语义与旧版等价
+        # 注: pre_v1 (forestVersion==1 且 seq<drift_events[0]) 作为所有漂移点共用的全局
+        #     基线 — 即系统初始稳定段, 用于 def2 的 AUC 基线和 def3 的 FPR 基线。
+        # 注: 每个漂移点 i 的滑窗扫描上界 = 下一个漂移点 (最后一个扫到 n), 避免扫过
+        #     下一个漂移导致指标被污染。
+        delays = {
+            "definition_1_first_new_version": [],
+            "definition_2_auc_recovery": [],
+            "definition_3_fpr_stable": [],
+        }
 
-        # ===== 向量化预处理: sort by seq + 转 numpy (一次性, 供定义2/3 滑窗用) =====
+        # ===== 向量化预处理 (一次性, 供 def2/3 所有漂移点的滑窗用) =====
         # seq 在 Flink 并行下无序, searchsorted 需有序; AUC/FPR 不依赖行序, sort 不改数值
         _sorted = df.sort_values("seq")
         _seq = _sorted["seq"].to_numpy()
         _label = _sorted["label"].to_numpy()
         _score = _sorted["score"].to_numpy()
+        win = 1000  # 滑窗大小
 
-        # 定义 2: AUC 回到漂移前 95%
-        # 用 1000 条滑动窗口看 AUC 恢复
-        win = 1000
+        # 漂移点列表 (与 drift_events 一一对应) + 每个漂移点的扫描上界
+        dp_list = [int(e["start_line"]) for e in drift_events] if drift_events else [drift_point]
+        dp_upper = [dp_list[i+1] if i+1 < len(dp_list) else n for i in range(len(dp_list))]
+
+        # 漂移前基线 (全局, 所有漂移点共用): forestVersion==1 且 seq < 第一个漂移点
+        baseline_auc = None
+        baseline_fpr = None
         if len(pre_v1) > 0:
             baseline_auc = compute_auc(pre_v1["label"], pre_v1["score"])
-            target = baseline_auc * 0.95
-            print(f"    定义2 (AUC 回到漂移前 95%)")
-            print(f"      漂移前 AUC 基线: {baseline_auc:.4f}")
-            print(f"      目标: {target:.4f}")
-            recovery_seq = None
+            baseline_fpr, _ = compute_fpr_fnr(pre_v1["label"], pre_v1["score"], 0.5)
 
-            for start in range(drift_point, n - win, 100):
-                lo = np.searchsorted(_seq, start, side="left")
-                hi = np.searchsorted(_seq, start + win, side="left")
-                if hi - lo < 100:
-                    continue
-                w_auc = compute_auc(_label[lo:hi], _score[lo:hi])
-                if w_auc and w_auc >= target:
-                    recovery_seq = start
-                    break
-            if recovery_seq:
-                delay_2 = recovery_seq - drift_point
-                print(f"      恢复 @ seq={recovery_seq}")
-                print(f"      -> 延迟: {delay_2} 条数据")
-                delays["definition_2_auc_recovery"] = {
-                    "baseline_auc": baseline_auc, "target_auc": target,
-                    "recovery_seq": recovery_seq, "delay_records": delay_2,
-                }
+        print(f"\n[5] 漂移响应延迟 (共 {len(dp_list)} 个漂移点)")
+        if baseline_auc is not None:
+            print(f"    全局基线 AUC: {baseline_auc:.4f}, 全局基线 FPR@0.5: {baseline_fpr*100:.1f}%")
+
+        # 漂移#i 之前(即 seq < dp_i 范围内)的最大 forestVersion, 用于 def1 判定"新版本"
+        # 单漂移下: dp_0 之前全是 v1, 该值=1, 等价于原 forestVersion>1 判据
+        for i, dp in enumerate(dp_list):
+            upper = dp_upper[i]
+            ver_before = int(df[df["seq"] < dp]["forestVersion"].max()) if (df["seq"] < dp).any() else 1
+            print(f"\n  --- 漂移 #{i} @ seq={dp} (扫描上界 seq={upper}, ver_before={ver_before}) ---")
+
+            # 定义 1: 漂移区间 [dp, upper) 内首次出现比 ver_before 更新的森林版本
+            seg_new_ver = df[(df["seq"] >= dp) & (df["seq"] < upper) & (df["forestVersion"] > ver_before)]
+            if len(seg_new_ver) > 0:
+                first_new = int(seg_new_ver["seq"].min())
+                delay_1 = first_new - dp
+                print(f"    定义1 (首次出现 ver>{ver_before}): @ seq={first_new}, 延迟 {delay_1} 条")
+                delays["definition_1_first_new_version"].append({
+                    "drift_idx": i, "drift_point": dp,
+                    "first_new_version_seq": first_new, "delay_records": delay_1,
+                })
             else:
-                print(f"      未恢复到 95% 基线")
-                delays["definition_2_auc_recovery"] = None
-        
-        # 定义 3: FPR <= 10%
-        print(f"    定义3 (FPR @ 阈值 0.5 <= 10%)")
-        if len(pre_v1) > 0:
-            pre_fpr, _ = compute_fpr_fnr(pre_v1["label"], pre_v1["score"], 0.5)
-            print(f"      漂移前 FPR 基线: {pre_fpr*100:.1f}%")
-            peak_fpr = 0
-            stable_seq = None
-            
-            for start in range(drift_point, n - win, 100):
-                lo = np.searchsorted(_seq, start, side="left")
-                hi = np.searchsorted(_seq, start + win, side="left")
-                if hi - lo < 100:
-                    continue
-                fpr, _ = compute_fpr_fnr(_label[lo:hi], _score[lo:hi], 0.5)
-                if fpr is None:
-                    continue
-                peak_fpr = max(peak_fpr, fpr)
-                if fpr <= 0.10 and stable_seq is None:
-                    stable_seq = start
-                    break
-            print(f"      漂移期峰值 FPR: {peak_fpr*100:.1f}%")
-            if stable_seq:
-                delay_3 = stable_seq - drift_point
-                print(f"      稳定 @ seq={stable_seq}")
-                print(f"      -> 延迟: {delay_3} 条数据")
-                delays["definition_3_fpr_stable"] = {
-                    "peak_fpr": peak_fpr, "stable_seq": stable_seq,
-                    "delay_records": delay_3,
-                }
-            else:
-                print(f"      数据末尾仍未稳定到 <= 10%")
-                delays["definition_3_fpr_stable"] = None
+                print(f"    定义1: 区间内未产生新版本 (HDDM 未触发或 COOLDOWN 未完成)")
+                delays["definition_1_first_new_version"].append({
+                    "drift_idx": i, "drift_point": dp, "first_new_version_seq": None, "delay_records": None,
+                })
+
+            # 定义 2: AUC 回到全局基线 95% (仅在 [dp, upper) 内扫)
+            if baseline_auc is not None:
+                target = baseline_auc * 0.95
+                recovery_seq = None
+                for start in range(dp, upper - win, 100):
+                    lo = np.searchsorted(_seq, start, side="left")
+                    hi = np.searchsorted(_seq, start + win, side="left")
+                    if hi - lo < 100:
+                        continue
+                    w_auc = compute_auc(_label[lo:hi], _score[lo:hi])
+                    if w_auc and w_auc >= target:
+                        recovery_seq = start
+                        break
+                if recovery_seq:
+                    delay_2 = recovery_seq - dp
+                    print(f"    定义2 (AUC>={target:.4f}): @ seq={recovery_seq}, 延迟 {delay_2} 条")
+                    delays["definition_2_auc_recovery"].append({
+                        "drift_idx": i, "drift_point": dp,
+                        "baseline_auc": baseline_auc, "target_auc": target,
+                        "recovery_seq": recovery_seq, "delay_records": delay_2,
+                    })
+                else:
+                    print(f"    定义2: 区间内未恢复到 95% 基线")
+                    delays["definition_2_auc_recovery"].append({
+                        "drift_idx": i, "drift_point": dp,
+                        "baseline_auc": baseline_auc, "target_auc": target,
+                        "recovery_seq": None, "delay_records": None,
+                    })
+
+            # 定义 3: FPR <= 10% (仅在 [dp, upper) 内扫)
+            if baseline_fpr is not None:
+                peak_fpr = 0
+                stable_seq = None
+                for start in range(dp, upper - win, 100):
+                    lo = np.searchsorted(_seq, start, side="left")
+                    hi = np.searchsorted(_seq, start + win, side="left")
+                    if hi - lo < 100:
+                        continue
+                    fpr, _ = compute_fpr_fnr(_label[lo:hi], _score[lo:hi], 0.5)
+                    if fpr is None:
+                        continue
+                    peak_fpr = max(peak_fpr, fpr)
+                    if fpr <= 0.10 and stable_seq is None:
+                        stable_seq = start
+                        break
+                if stable_seq:
+                    delay_3 = stable_seq - dp
+                    print(f"    定义3 (FPR<=10%): @ seq={stable_seq}, 延迟 {delay_3} 条, 峰值 FPR {peak_fpr*100:.1f}%")
+                    delays["definition_3_fpr_stable"].append({
+                        "drift_idx": i, "drift_point": dp,
+                        "peak_fpr": peak_fpr, "stable_seq": stable_seq, "delay_records": delay_3,
+                    })
+                else:
+                    print(f"    定义3: 区间内未稳定到 <=10%, 峰值 FPR {peak_fpr*100:.1f}%")
+                    delays["definition_3_fpr_stable"].append({
+                        "drift_idx": i, "drift_point": dp,
+                        "peak_fpr": peak_fpr, "stable_seq": None, "delay_records": None,
+                    })
+
         result["delays"] = delays
     
     # [6] 滑动窗口导出 (供画图)
