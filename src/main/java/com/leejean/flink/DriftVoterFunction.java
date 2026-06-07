@@ -71,8 +71,21 @@ public class DriftVoterFunction
 
         if (report.getVote() == DriftReport.DriftVote.INITIATE) {
             if (av != null) {
-                LOG.warn("Received INITIATE from subtask {} while round {} is active, ignoring",
-                        report.getSubtask(), av.roundId);
+                // v5.0: 活跃轮次内的独立 INITIATE = 该 subtask 对本轮的同意 → 计为 YES(幂等)。
+                // 旧逻辑直接丢弃,导致同步检测(IKS 无 WARN,多 subtask 同时 INITIATE)下
+                // 本可通过的投票被全丢成弃权而流产。
+                // v5.0: an INITIATE arriving during an active round means this subtask
+                // independently detected the same drift → count it as a YES (idempotent).
+                if (!av.yesVoters.contains(report.getSubtask())
+                        && !av.noVoters.contains(report.getSubtask())) {
+                    av.yesVoters.add(report.getSubtask());
+                    activeVote.update(av);
+                    LOG.info("DriftVoter: INITIATE from subtask {} during active round {} counted as YES",
+                            report.getSubtask(), av.roundId);
+                    if (av.yesVoters.size() + av.noVoters.size() >= parallelism) {
+                        resolveVote(av, ctx, out);
+                    }
+                }
                 return;
             }
 

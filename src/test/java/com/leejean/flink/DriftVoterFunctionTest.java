@@ -141,30 +141,71 @@ public class DriftVoterFunctionTest {
     }
 
     /**
-     * V34-5：重复 INITIATE 在进行中的轮次 → 被忽略
-     * V34-5: duplicate INITIATE while round active → ignored
+     * V34-5 (v5.0 改写)：活跃轮次内的独立 INITIATE 计为 YES,且幂等。
+     * 旧版本断言「第二个 INITIATE 被忽略」——这是 IKS 同步检测暴露的协议缺口,已修。
+     * V34-5 (v5.0 rewrite): a concurrent INITIATE during an active round counts
+     * as YES (independent detection of the same drift), and duplicate INITIATEs
+     * from the same subtask are idempotent.
      */
     @Test
-    public void testDuplicateInitiateIgnored() throws Exception {
+    public void testConcurrentInitiateCountsAsYes() throws Exception {
         List<DriftReport> reports = new ArrayList<>();
         reports.add(new DriftReport(0, 100L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
-        // 第二个 INITIATE（应被忽略）/ second INITIATE (should be ignored)
+        // 第二个 INITIATE 来自不同 subtask,活跃期内 → 计 YES
         reports.add(new DriftReport(2, 150L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
-        // 正常投票完成第一轮 / complete first round normally
+        // 同一 subtask 重复 INITIATE → 幂等,不再加票
+        reports.add(new DriftReport(2, 160L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
+        // subtask 1 正常 YES;subtask 3 NO 闭合本轮 / close the round
         reports.add(new DriftReport(1, 200L, DriftStatus.WARN, 1L, DriftReport.DriftVote.YES));
-        reports.add(new DriftReport(2, 300L, DriftStatus.WARN, 1L, DriftReport.DriftVote.YES));
         reports.add(new DriftReport(3, 400L, DriftStatus.STABLE, 1L, DriftReport.DriftVote.NO));
 
         runVoter(reports);
 
-        // 只有一轮：VOTING + COMMITTED，不应有第二个 VOTING
+        // 只有一轮:VOTING + 决议;subtask 2 的 INITIATE 算 YES。
+        // 4 票集齐(yes={0,1,2}, no={3}) → 直接 COMMITTED,不必等超时。
         assertEquals(2, RoundSink.values.size(), "Should emit exactly 2 (one round)");
         assertEquals(DriftRoundMessage.RoundStatus.VOTING, RoundSink.values.get(0).getStatus());
         assertEquals(1L, RoundSink.values.get(0).getRoundId());
-        // 不应该有 roundId=2
-        for (DriftRoundMessage msg : RoundSink.values) {
-            assertEquals(1L, msg.getRoundId(), "Only roundId=1 should exist");
-        }
+
+        DriftRoundMessage result = RoundSink.values.get(1);
+        assertEquals(1L, result.getRoundId(), "Only roundId=1 should exist");
+        assertEquals(DriftRoundMessage.RoundStatus.COMMITTED, result.getStatus());
+        assertEquals(3, result.getVotesYes(), "yes = {0 (initiator), 2 (concurrent INITIATE), 1 (YES)}");
+        assertEquals(1, result.getVotesNo());
+        assertEquals(0, result.getVotesAbstain());
+    }
+
+    /**
+     * v5.0 回归用例:复刻 IKS 同步检测 bug。
+     * p=4,subtask 2 抢先 INITIATE,subtask 0/1/3 在活跃期独立 INITIATE。
+     * 期望:全部计为 YES,4 票集齐 → COMMITTED yes=4 no=0 abstain=0。
+     * v5.0 regression for the IKS synchronous-detection bug: when all subtasks
+     * independently INITIATE within the active window, the round must COMMIT
+     * with 4 YES votes (no abstain), not abort.
+     */
+    @Test
+    public void testConcurrentInitiatesAllYes_committed() throws Exception {
+        List<DriftReport> reports = new ArrayList<>();
+        // subtask 2 抢先 / subtask 2 initiates
+        reports.add(new DriftReport(2, 100L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
+        // 其余三个 subtask 同步独立 INITIATE / others independently INITIATE
+        reports.add(new DriftReport(0, 110L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
+        reports.add(new DriftReport(1, 120L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
+        reports.add(new DriftReport(3, 130L, DriftStatus.DRIFT, 0L, DriftReport.DriftVote.INITIATE));
+
+        runVoter(reports);
+
+        // VOTING + COMMITTED;不必等超时(集齐立即决议)
+        assertEquals(2, RoundSink.values.size(), "Should emit exactly 2 (one round)");
+        assertEquals(DriftRoundMessage.RoundStatus.VOTING, RoundSink.values.get(0).getStatus());
+
+        DriftRoundMessage result = RoundSink.values.get(1);
+        assertEquals(1L, result.getRoundId());
+        assertEquals(DriftRoundMessage.RoundStatus.COMMITTED, result.getStatus(),
+                "concurrent INITIATEs from all subtasks must COMMIT, not abort");
+        assertEquals(4, result.getVotesYes());
+        assertEquals(0, result.getVotesNo());
+        assertEquals(0, result.getVotesAbstain());
     }
 
     // ===== 辅助方法 / Helper methods =====
