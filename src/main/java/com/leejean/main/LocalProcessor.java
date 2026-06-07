@@ -78,9 +78,11 @@ import java.util.UUID;
  *   --ringBufferSize        环形缓冲区大小，默认 1000
  *   --parallelism           并行度，默认 4
  *   --seed                  可选，固定随机种子
- *   --detector              漂移检测器类型：HDDM_A_Windowed（默认）| HDDM_A | HDDM_W
+ *   --detector              漂移检测器类型：HDDM_A_Windowed（默认）| HDDM_A | HDDM_W | IKS
  *   --hddmWindowSize        HDDM_A_Windowed 窗口大小，默认 2000
  *   --hddmLambda            HDDM_W 的 EWMA 遗忘因子，范围 (0, 1]，默认 0.1
+ *   --iksWindowSize         IKS reference/current 窗口大小 W，默认 2000
+ *   --iksPValue             IKS KS 检验显著性水平 p-value，范围 (0, 1)，默认 0.001
  *   --warnConfidence        HDDM WARN 置信度，默认 0.005
  *   --driftConfidence       HDDM DRIFT 置信度，默认 0.001
  *   --warnTimeoutSamples    WARN 超时样本数，默认 2000
@@ -114,6 +116,8 @@ public class LocalProcessor {
         String detector = params.get("detector", "HDDM_A_Windowed");
         int hddmWindowSize = params.getInt("hddmWindowSize", 2000);
         double hddmLambda = params.getDouble("hddmLambda", 0.1);
+        int iksWindowSize = params.getInt("iksWindowSize", 2000);
+        double iksPValue = params.getDouble("iksPValue", 0.001);
         double warnConfidence = params.getDouble("warnConfidence", hddmDefaults.getWarnConfidence());
         double driftConfidence = params.getDouble("driftConfidence", hddmDefaults.getDriftConfidence());
         long warnTimeoutSamples = params.getLong("warnTimeoutSamples", hddmDefaults.getWarnTimeoutSamples());
@@ -146,6 +150,8 @@ public class LocalProcessor {
         System.out.println("Detector: " + detector);
         System.out.println("HDDM window size: " + hddmWindowSize);
         System.out.println("HDDM lambda: " + hddmLambda);
+        System.out.println("IKS window size: " + iksWindowSize);
+        System.out.println("IKS pValue: " + iksPValue);
         System.out.println("Warn confidence: " + warnConfidence);
         System.out.println("Drift confidence: " + driftConfidence);
         System.out.println("Warn timeout samples: " + warnTimeoutSamples);

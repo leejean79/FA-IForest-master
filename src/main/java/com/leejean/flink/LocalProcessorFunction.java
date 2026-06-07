@@ -13,6 +13,8 @@ import com.leejean.drift.HDDM_A;
 import com.leejean.drift.HDDM_AConfig;
 import com.leejean.drift.HDDM_A_Windowed;
 import com.leejean.drift.HDDM_W;
+import com.leejean.drift.IKS;
+import com.leejean.drift.IKSConfig;
 import com.leejean.tree.Forest;
 import com.leejean.tree.ITree;
 import com.leejean.tree.ITreeBuilder;
@@ -119,6 +121,8 @@ public class LocalProcessorFunction
     private transient String detectorType;
     private transient int hddmWindowSize;
     private transient double hddmLambda;   // v4.0: HDDM_W 的 EWMA 遗忘因子 / EWMA decay for HDDM_W
+    private transient int iksWindowSize;    // v5.0: IKS reference/current 窗口大小 / IKS window size
+    private transient double iksPValue;     // v5.0: IKS KS 检验 p-value / IKS KS-test p-value
     private transient int cooldownSamples;
     private transient double zThresholdK;
 
@@ -202,6 +206,8 @@ public class LocalProcessorFunction
         detectorType = params.get("detector", "HDDM_A_Windowed");
         hddmWindowSize = params.getInt("hddmWindowSize", 2000);
         hddmLambda = params.getDouble("hddmLambda", 0.1);   // v4.0: HDDM_W default λ=0.1
+        iksWindowSize = params.getInt("iksWindowSize", 2000);   // v5.0
+        iksPValue = params.getDouble("iksPValue", 0.001);        // v5.0
         cooldownSamples = params.getInt("cooldownSamples", 2000);
         zThresholdK = params.getDouble("zThresholdK", 1.0);
 
@@ -209,8 +215,8 @@ public class LocalProcessorFunction
         String pauseModeStr = params.get("pauseMode", "USE_OLD_FOREST");
         pauseMode = PauseMode.valueOf(pauseModeStr);
 
-        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, detector={}, hddmWindowSize={}, hddmLambda={}, cooldownSamples={}, warnTimeout={}, pauseMode={}",
-                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, detectorType, hddmWindowSize, hddmLambda, cooldownSamples, warnTimeoutBehavior, pauseMode);
+        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, detector={}, hddmWindowSize={}, hddmLambda={}, cooldownSamples={}, warnTimeout={}, pauseMode={}, iksWindowSize={}, iksPValue={}",
+                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, detectorType, hddmWindowSize, hddmLambda, cooldownSamples, warnTimeoutBehavior, pauseMode, iksWindowSize, iksPValue);
     }
 
     private DriftDetector createDetector() {
@@ -221,6 +227,8 @@ public class LocalProcessorFunction
                 return new HDDM_A_Windowed(hddmConfig, hddmWindowSize);
             case "HDDM_W":                                       // v4.0
                 return new HDDM_W(hddmConfig, hddmLambda);       // v4.0
+            case "IKS":                                               // v5.0
+                return new IKS(new IKSConfig(iksWindowSize, iksPValue)); // v5.0
             default:
                 throw new IllegalArgumentException("Unknown detector: " + detectorType);
         }

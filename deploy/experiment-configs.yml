@@ -27,18 +27,16 @@ configs:
 
 # ---------- 实验 4: 算法对比 ----------
 # detector 参数 (LocalProcessor --detector)
-# ⚠️ 代码现状 (LocalProcessorFunction.java switch): 只实现了 HDDM_A 和 HDDM_A_Windowed
-#    HDDM_W_Windowed 和 IKS 还没实现, 传进去会抛 IllegalArgumentException
-#    实验 4 要等这两个 detector 实现后才能跑
+# 与 LocalProcessorFunction.createDetector switch case 串完全一致。
 algorithms:
   HDDM_A:
     detector: HDDM_A_Windowed        # 已实现 ✅
   HDDM_A_Cumulative:
     detector: HDDM_A                 # 已实现 ✅ (累积版, 非窗口)
   HDDM_W:
-    detector: HDDM_W
-  # IKS:
-  #   detector: IKS                   # ❌ 未实现
+    detector: HDDM_W                 # v4.0 已实现 ✅ (detector 串是 HDDM_W, 不是 HDDM_W_Windowed)
+  IKS:
+    detector: IKS                    # v5.0 已实现 ✅
 
 # ---------- 实验计划 ----------
 plans:
@@ -95,14 +93,12 @@ plans:
     repeats: 3
 
   # 实验 4: 算法对比 (3 数据集 x 3 算法 x 5 重复 = 45)
-  # ⚠️ 暂不可跑: IKS / HDDM_W_Windowed 未实现 (见上方 algorithms 注释)
-  #    等算法实现后, 把 algorithms 改回 [HDDM_A, HDDM_W, IKS] 即可
   exp4:
     datasets: [synth_abrupt, insects_gradual_imbalanced, synth_incremental]
     configs: [C4]
-    algorithms: [HDDM_A, HDDM_A_Cumulative]    # 临时: 只跑已实现的两个
+    algorithms: [HDDM_A, HDDM_W, IKS]
     repeats: 5
-    enabled: false                              # run-batch.sh 会跳过 enabled=false 的 plan
+    enabled: true
 
   # Sensitivity: 参数敏感性 (单数据集, 扫描 3 个参数)
   sensitivity:
