@@ -1,5 +1,6 @@
 package com.leejean.drift;
 
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -20,7 +21,8 @@ import java.util.concurrent.ThreadLocalRandom;
  * <p>Port of {@code Treap.py} for IKSSW drift detector (phase 2). This class
  * is package-private; its sole user is the upcoming {@code IKS} detector.
  */
-class Treap<K extends Comparable<K>> {
+class Treap<K extends Comparable<K>> implements Serializable {
+    private static final long serialVersionUID = 1L;
 
     final K key;
     long value;
@@ -230,7 +232,9 @@ class Treap<K extends Comparable<K>> {
 
     // ====================== split holder ======================
 
-    static final class SplitResult<K extends Comparable<K>> {
+    static final class SplitResult<K extends Comparable<K>> implements Serializable {
+        private static final long serialVersionUID = 1L;
+
         final Treap<K> left;
         final Treap<K> right;
 
