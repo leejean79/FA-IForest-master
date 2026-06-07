@@ -130,21 +130,54 @@ class IKSTest {
         assertFalse(detector.warnTimedOut());
     }
 
-    // ---------------- B4 no drift under repeats / constant stream ----------------
+    // ---------------- B4 dispersed stable values ----------------
 
     @Test
-    void b4_constantStream_noDrift_noException() {
+    void b4_dispersedStableValues_noDrift_ksStaysSmall() {
+        // 平稳流但值分散:循环一组互异值,warm-up 后持续滑动同分布。
+        // 此情形每桶最多 1 ref + 1 cur,lex 偏差 ≤ 1/W;value_KS = 0 → ks() ≤ 1/W。
+        int W = 60;
+        IKS detector = new IKS(new IKSConfig(W, 0.001));
+
+        // W 个互异值循环喂入
+        double[] palette = new double[W];
+        Random rng = new Random(123);
+        TreeSet<Double> seen = new TreeSet<>();
+        for (int i = 0; i < W; ) {
+            double v = rng.nextDouble();
+            if (seen.add(v)) palette[i++] = v;
+        }
+
+        // warm-up
+        for (int i = 0; i < W; i++) detector.update(palette[i]);
+
+        // 滑动:继续循环同一组值,sliding 内容仍是 palette 的某个轮转 → 与 R 同 multiset
+        for (int i = 0; i < 5 * W; i++) {
+            double v = palette[i % W];
+            DriftStatus s = detector.update(v);
+            assertNotEquals(DriftStatus.DRIFT, s,
+                    "dispersed stable stream should not drift (i=" + i + ")");
+        }
+        // 每桶 ≤1 ref + 1 cur → 严格界 ks() ≤ 1/W
+        assertTrue(detector.ks() <= 1.0 / W + EPS,
+                "dispersed stable stream: ks should be ≤ 1/W, got " + detector.ks());
+    }
+
+    // ---------------- B4b heavy repeats / constant stream ----------------
+
+    @Test
+    void b4b_constantStream_noDrift_noException() {
+        // 恒定流:同值大量重复(每桶含 W ref + W cur,混号大桶)。
+        // 此情形 lex 偏差是同桶随机游走 O(√W)/W,可超 1/W 但仍远低于阈值。
+        // 关键验证:Remove 必须借助复合 key 的 rnd tiebreak 精确命中当初插入的节点。
         int W = 100;
         IKS detector = new IKS(new IKSConfig(W, 0.001));
         for (int i = 0; i < W; i++) detector.update(0.5);
-        // 持续滑动同值;不应触发 DRIFT
-        // (重复值压力:每个 cur(0.5) 节点用不同 rnd,Remove 必须精确命中插入时的那个)
         for (int i = 0; i < 5 * W; i++) {
             DriftStatus s = detector.update(0.5);
             assertNotEquals(DriftStatus.DRIFT, s,
                     "constant stream should never drift (i=" + i + ")");
         }
-        // ks ≈ 0(粗略上界:随机游走 O(√W)/W)
         assertTrue(detector.ks() < detector.threshold(),
                 "ks below threshold on constant stream, got " + detector.ks());
     }
@@ -205,20 +238,6 @@ class IKSTest {
             double ks = detector.ks();
             assertTrue(ks >= -EPS && ks <= 1.0 + EPS, "ks out of [0,1]: " + ks);
         }
-    }
-
-    @Test
-    void b6_heavyRepeats_removeHitsCorrectKey() {
-        // 全 0.5,大量重复值;Remove 必须借助复合 key 的 rnd tiebreak 命中
-        // 当初插入的具体那一个 cur 节点(否则 G 累积错误)。
-        int W = 40;
-        IKS detector = new IKS(new IKSConfig(W, 0.001));
-        for (int i = 0; i < W; i++) detector.update(0.5);
-        for (int i = 0; i < 10 * W; i++) {
-            DriftStatus s = detector.update(0.5);
-            assertNotEquals(DriftStatus.DRIFT, s);
-        }
-        assertTrue(detector.ks() < detector.threshold());
     }
 
     // ---------------- 配置 / 边界 ----------------
