@@ -703,6 +703,17 @@ public class LocalProcessorFunction
                     subtaskIndex);
         } else {
             List<DataPoint> snapshot = rb.snapshot();
+
+            // TEMP DIAG: 训练池规模 + 异常占比 + 终止条件
+            int poolAnomaly = 0;
+            for (DataPoint dp : snapshot) {
+                if (dp.getLabel() == 1) poolAnomaly++;   // ← 按 DataPoint 实际标签访问器改(getLabel/isAnomaly/getY)
+            }
+            LOG.info("subtask={}: COOLDOWN-POOL-DIAG rbSize={} cWrites={} cN={} poolAnomaly={} poolNormal={} anomalyFrac={}",
+                    subtaskIndex, rb.size(), cooldownWrites.value(), cooldownN.value(),
+                    poolAnomaly, snapshot.size() - poolAnomaly,
+                    (double) poolAnomaly / snapshot.size());
+
             List<double[]> pool = new ArrayList<>(snapshot.size());
             for (DataPoint dp : snapshot) {
                 pool.add(dp.getFeatures());
