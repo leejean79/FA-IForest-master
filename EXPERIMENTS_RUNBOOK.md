@@ -243,7 +243,7 @@ bash deploy/scripts/pull-results.sh --clean-remote   # 拉完删 master 上的 (
 ### 5.2 批量分析
 
 ```bash
-bash deploy/scripts/analyze-all.sh
+bash analysis/analyze-all.sh
 ```
 
 产出在 `analysis-output/`:

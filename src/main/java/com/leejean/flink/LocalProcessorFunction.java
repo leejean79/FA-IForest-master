@@ -129,6 +129,7 @@ public class LocalProcessorFunction
     // v3.4 配置 / v3.4 configuration
     private transient PauseMode pauseMode;
 
+
     @Override
     public void open(Configuration parameters) throws Exception {
         // v3.1 Phase B state
@@ -217,6 +218,7 @@ public class LocalProcessorFunction
 
         LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, detector={}, hddmWindowSize={}, hddmLambda={}, cooldownSamples={}, warnTimeout={}, pauseMode={}, iksWindowSize={}, iksPValue={}",
                 subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, detectorType, hddmWindowSize, hddmLambda, cooldownSamples, warnTimeoutBehavior, pauseMode, iksWindowSize, iksPValue);
+
     }
 
     private DriftDetector createDetector() {
@@ -476,19 +478,21 @@ public class LocalProcessorFunction
         cooldownMean.update(cMean);
         cooldownM2.update(cM2);
 
+
         // z-score 阈值写入环形缓冲 / z-score threshold ring buffer write
         boolean written = false;
         if (cN >= 50) {
             double std = Math.sqrt(cM2 / (cN - 1));
             double threshold = cMean + zThresholdK * std;
-            if (score < threshold) {
+            if (score < threshold) {     // 原来只有 score < threshold
+//            if (score < threshold) {
                 writeToRingBuffer(point);
                 written = true;
             }
         } else {
-            // 前 50 条全部写入（初始化）/ first 50 all written (initialization)
-            writeToRingBuffer(point);
-            written = true;
+                // 前 50 条全部写入（初始化）/ first 50 all written (initialization)
+                writeToRingBuffer(point);
+                written = true;
         }
 
         // v3.4.7: 维护写入计数 / track actual ringBuffer writes
