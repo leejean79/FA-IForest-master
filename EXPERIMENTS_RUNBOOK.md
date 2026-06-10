@@ -5,24 +5,25 @@
 
 ---
 
-## 0. 实验总览
+## 0. 实验总览 (方向二(a))
 
-| 实验 | plan 名 | 规模 | 数据集 | 目的 |
-|---|---|---|---|---|
-| 实验 1 (HDDM_A) | `exp1` | 120 (6×4×5) | 4 synth + 2 insects | C1-C4 配置对漂移检测的影响 (用默认 HDDM_A_Windowed) |
-| 实验 1 (HDDM_W) | `exp1_hddm_w` | 120 (6×4×5) | 同 exp1 | 同 exp1 维度, 切换为 HDDM_W (λ=0.1), 用于算法对比 |
-| 实验 2 | `exp2` | 150 (5×30) | 5 stationary | stationary AUC 稳定性 (30 次 shuffle) |
-| 实验 3 | `exp3` | 24 (2×4×3) | donors, http | 可扩展性 (parallelism 1/2/4/6) |
-| 实验 4 | `exp4` | 禁用 | — | 算法对比 (HDDM_W 已实现; 等 IKS 实现后启用) |
-| 敏感性 (buffer/window/cooldown) | `sensitivity` | 30 | synth_abrupt | OAT 参数网格扫描 (ringBufferSize / hddmWindowSize / cooldownSamples) |
-| 敏感性 (HDDM 置信度) | `sensitivity_hddm_conf` | 12 | insects_abrupt_imbalanced | 成对放宽倍率: warnConfidence + driftConfidence (基线 + 10×/20×/40×) |
-| 冒烟 | `smoke_batch` | 4 | synth_abrupt | 批量调度验证 (非正式实验) |
+> 已废: `exp1_hddm_w` (HDDM_W 算法对比)、`sensitivity_hddm_conf` (warnConfidence/driftConfidence 成对扫)、C1–C4 中的 `warnTimeoutBehavior` 维度 (无 WARN 状态了)。
+> 详见 `HANDOVER_direction2a_phase3_arch.md`。
 
-**配置矩阵 (C1-C4)**: `pauseMode` × `warnTimeoutBehavior` 的 2×2
-- C1: USE_OLD_FOREST + DISCARD
-- C2: USE_OLD_FOREST + PROMOTE
-- C3: BACKLOG_THEN_NEW_FOREST + DISCARD
-- C4: BACKLOG_THEN_NEW_FOREST + PROMOTE
+| 实验 | 目的 | 网格 | 数据集 |
+|---|---|---|---|
+| **EXP1 (核心)** | 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率 | 见下 + Phase3 附录 B | synth_abrupt + INSECTS_abrupt (+1~2 drift 型) |
+| EXP2 | stationary 误触发率 (per-feature 在无漂移流上应几乎不 fire = 精度基线) | 5 × 30 shuffle | 5 个 stationary |
+| EXP3 | 扩展性 + Fork 2 (source partition=P) | P∈{1,2,4,6} | donors / http |
+| EXP4 (可选) | per-feature IKS vs per-feature HDDM | — | — |
+
+**EXP1 最小网格** (不跑全组合): `{新 per-feature vs 旧 score 行并行} × P∈{1,2,4} × 数据集 × 3~5 seed`。
+- 「**新**」臂 = Phase 3 检测面 build;「**旧**」臂 = 删检测前的 score 域 build (如 `feature/hddm-w` 或 Phase 3 前的 tag)。**两臂不同 build** —— Phase 3 已移除 score 检测, 同一 build 跑不了旧法。
+- 不想重跑旧臂: 直接引用 finding 1 已记录的稀释数 (INSECTS abrupt: p=1→342 WARN、p=4→0), EXP1 只跑**新臂 across P** 证 P-不变即可。
+- **三个观测项** (恢复曲线 / v1-v2 森林对比 / 重训频率) 定义与采集口径见 `HANDOVER_direction2a_phase3_arch.md` **附录 B**。
+
+**配置矩阵 (收缩)**: `WARN` 已移除 → `warnTimeoutBehavior` (PROMOTE/DISCARD) 维度作废。只剩
+`pauseMode ∈ {USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST}` (COOLDOWN/WAITING 期打分行为)。原 C1–C4 收为这两个 pauseMode 配置。
 
 ---
 
@@ -122,38 +123,36 @@ tail -f exp1.out
 - **mac 不能睡眠**: nohup 防 ssh 断开, 但防不了电脑睡眠。合盖/睡眠 → 主控进程冻结 → 集群 job 卡住。
   插电 + `caffeinate -s nohup ...` 阻止睡眠, 或直接用 2.2.1 的 master 自治模式 (推荐)。
 
-### 2.3 单次实验 (调试用)
+### 2.3 单次实验 (调试用) + 新参数
 
 ```bash
 bash deploy/scripts/run-experiment.sh \
-    --dataset synth_abrupt --config-id C1 --run-id 1
+    --dataset synth_abrupt --config-id <pauseMode> --run-id 1 [--parallelism N]
 ```
 
-参数:
-- `--dataset` 数据集名 (见 datasets.yml)
-- `--config-id` C1/C2/C3/C4
-- `--run-id` 重复序号 (实验 2 用作 shuffle seed)
-- `--parallelism N` (可选, 实验 3 用; output-scores partition 同步此值)
-- `--shuffle` (可选, 实验 2 用)
-- `--algorithm X` (可选): 算法 id, 从 experiment-configs.yml 的 `algorithms:` 段查 detector。
-  当前已注册: `HDDM_A` (→ HDDM_A_Windowed), `HDDM_A_Cumulative` (→ HDDM_A), `HDDM_W` (→ HDDM_W)。
-  传错的 id (如 `IKS` 当前未实现) 会让 LocalProcessor 启动时抛 IllegalArgumentException。
-- `--extra-param "k1=v1[;k2=v2...]"` (可选): 通用参数透传, 翻译成 `--k1 v1 --k2 v2` 给
-  LocalProcessor。多对参数用分号分隔, 单对不需要分号。常见用法:
-  - HDDM_W 的 λ:                 `--extra-param "hddmLambda=0.1"`
-  - HDDM 置信度成对扫:           `--extra-param "warnConfidence=0.05;driftConfidence=0.01"`
-  - sensitivity 单参数:          `--extra-param "ringBufferSize=512"`
-  EXP_ID 会把 `=` 编码成 `-`、`;` 编码成 `_`, 结果目录天然不冲突。
+- `--dataset` 见 `datasets.yml`;`--config-id` 现取 pauseMode 配置;`--run-id` 重复序号 (EXP2 作 shuffle seed);`--parallelism N` (EXP1/EXP3 用, output-scores partition 同步);`--shuffle` (EXP2)。
+- **`--algorithm` 基本废**: 检测面固定 per-feature IKS;EXP4 才用它切 per-feature HDDM。`HDDM_A/HDDM_W` 作为 score 域检测器**不再用于主实验**。
 
-**示例 — HDDM_W 单次冒烟测试:**
+**检测面参数 (`--extra-param "k=v[;k2=v2]"` 透传), 替代旧的 `warnConfidence/driftConfidence/hddmLambda`:**
+
+| 参数 | 默认 | 段 |
+|---|---|---|
+| `iksWindowSize` | 2000 | per-feature IKS 窗 W |
+| `iksPValue` | 0.001 | `ca=√(−0.5·ln p)≈1.858` |
+| `confirmWin` | ~W | 峰值-KS 确认窗 C |
+| `ksConfirm` | 待标定 | 幅度门 (**不得伤 recall**) |
+| `aggK` | 2 | 聚合器共发特征门 |
+| `aggWin` | W | 聚合窗 |
+| `refractory` | ~重训周期 | 去抖 |
+
+**示例:**
 ```bash
 bash deploy/scripts/run-experiment.sh \
-    --dataset synth_abrupt --config-id C1 --run-id 1 \
-    --algorithm HDDM_W \
-    --extra-param "hddmLambda=0.1"
+    --dataset synth_abrupt --config-id USE_OLD_FOREST --run-id 1 \
+    --extra-param "iksWindowSize=2000;iksPValue=0.001;aggK=2"
 ```
-LocalProcessor 启动 banner 应显示 `Detector: HDDM_W` 和 `HDDM lambda: 0.1` (不是默认值),
-EXP_ID: `synth_abrupt_C1_HDDM_W_p4_r1_hddmLambda-0.1`。
+启动 banner 应打出 `IKS window: 2000 / IKS pValue: 0.001 / aggK: 2` (不是默认值);
+EXP_ID 形如 `synth_abrupt_USE_OLD_FOREST_iks_p4_r1_iksWindowSize-2000_..._aggK-2`。
 
 ---
 
@@ -211,6 +210,7 @@ bash deploy/scripts/cluster-monitor.sh -i 5   # 5 秒刷新
 ```
 
 显示: 3 节点 CPU/内存 / 容器状态 / Flink jobs / 6 个 topic offset / 当前实验。
+6 个 topic 中 `drift-topic` 已被 **`feature-drift-topic`** 取代 (检测面 per-feature 信号);其余 `source / tree / model / drift-round / output-scores` 不变。
 Ctrl+C 退出 (会清理 ssh 复用连接)。
 
 ### 4.1 从任意机器查看/控制实验
@@ -270,13 +270,13 @@ mode: `drift` (实验1/4) / `stationary` (实验2) / `scalability` (实验3) / `
 
 ```
 {dataset}_{config}_{algo}_p{N}_r{run}/
-├── scores.jsonl          # 主结果: 每行一个 ScoreResult (seq,id,score,label,phase,forestVersion)
-├── driftspec.json        # 漂移真值 (有漂移的数据集才有)
-├── job-config.json       # 本次实验的配置 + final_offset + status
-├── drift-topic.jsonl     # 漂移事件
+├── scores.jsonl              # 主结果: 每行一个 ScoreResult (seq,id,score,label,phase,forestVersion) —— 正好是 EXP1 三观测项的输入
+├── driftspec.json            # 漂移真值 (有漂移的数据集才有)
+├── job-config.json           # 本次实验的配置 + final_offset + status
+├── feature-drift-topic.jsonl # 检测面 per-feature 确认 onset (替代旧 drift-topic.jsonl)
 ├── drift-round-topic.jsonl
-├── model-topic.jsonl     # 全局森林版本记录
-└── runtime.log           # JobManager 日志末尾 100 行
+├── model-topic.jsonl         # 全局森林版本记录
+└── runtime.log               # JobManager 日志末尾 100 行
 ```
 
 **exp_id 命名**: `{dataset}_{config}_{algo}_p{N}_r{run}`
@@ -284,73 +284,55 @@ mode: `drift` (实验1/4) / `stationary` (实验2) / `scalability` (实验3) / `
 
 ---
 
-## 7. 推荐执行顺序
-
-实际工作方式是 master 自治模式 + tmux (见 2.2.1), 不是 mac 上 nohup。各 plan 串行,
-exp1 / exp1_hddm_w / exp2 / exp3 用各自的 tmux session 跑, 便于中途接入查看或停止。
+## 7. 推荐执行顺序 (方向二(a))
 
 ```bash
 ssh fa-master
 cd /opt/fa-iforest/repo
 
-# (1) 主实验链: exp1 → exp1_hddm_w → exp2 → exp3
-tmux new -s exp1
-RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp1 2>&1 | tee exp1.out
-# Ctrl+B D 脱离, exit 退 ssh, 实验在 master 自治继续
+# (1) EXP1 新臂 across P — 核心: 恢复曲线 + 重训频率 + P-不变
+tmux new -s exp1_new
+RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp1 2>&1 | tee exp1_new.out
+# Ctrl+B D 脱离;exit 退 ssh, 实验自治继续
 
-# exp1 完成后, 再起 exp1_hddm_w (HDDM_W 算法对比)
-tmux new -s exp1_hddm_w
-RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp1_hddm_w 2>&1 | tee exp1_hddm_w.out
+# (2) (可选) 旧臂对照 — 切到 score 域 build 再跑同网格;或直接引用 finding 1 的稀释数
 
-# exp2 / exp3
+# (3) EXP2 (stationary 误触发基线) → EXP3 (扩展性 / Fork 2), 后做
 tmux new -s exp2
 RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp2 2>&1 | tee exp2.out
-tmux new -s exp3
-RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp3 2>&1 | tee exp3.out
 
-# (2) 敏感性分析 (改完 yaml 一定先做 7.1 的防呆步骤再批量跑)
-RUN_MODE=local bash deploy/scripts/run-batch.sh --plan sensitivity              # buffer/window/cooldown OAT
-RUN_MODE=local bash deploy/scripts/run-batch.sh --plan sensitivity_hddm_conf    # HDDM 置信度成对扫
-
-# (3) 全部完成后拉结果分析 (在 mac 上)
+# (4) 拉结果分析 (在 mac 上)
 bash deploy/scripts/pull-results.sh
-bash deploy/scripts/analyze-all.sh
+bash analysis/analyze-all.sh
 ```
 
-**算法对比的产出位置**: exp1 (HDDM_A_Windowed 默认) 与 exp1_hddm_w (HDDM_W) 的结果目录
-分别带 `_default_` 和 `_HDDM_W_` 标识, 不会互相覆盖, 可直接做配对对比。
+**EXP1 三观测项** (拉回后离线重建, 见 Phase3 附录 B):
+- 恢复曲线: `scores.jsonl` (seq, score, label, forestVersion) 滑窗 AUC + forestVersion 切换线。
+- v1/v2 森林: 版本切换前后同一 eval 窗, 按 forestVersion 分组算 AUC (`v2≤v1` = stale-score COOLDOWN 池拖后腿, 触发「重训质量」workstream)。
+- 重训频率: `model-topic.jsonl` 的 distinct version 数 / run。
 
-**实验 4 (IKS) 启用条件**: 等 IKS detector 实现后, 把 experiment-configs.yml 的 `algorithms:`
-段取消 IKS 注释、并把 exp4 plan 的 `enabled: true` 打开即可。HDDM_W 已就绪, 不必再等。
+> `analyze.py` 需新增 `recovery` / `v1v2` / `retrain_freq` mode (或单独脚本);旧 `drift` mode 的 WARN/voting 统计已无意义。
 
-### 7.1 sensitivity 类 plan 的防呆步骤 (改 yaml 后必做)
+### 7.1 参数透传防呆 (改 yaml 后必做)
 
-sensitivity 测试最容易栽的坑: **参数名拼错或 shell 拆分错, LocalProcessor 静默兜底用默认值,
-跑了一堆其实 detector 行为完全没变**。所以每次改 sensitivity yaml (新增 plan / 改参数值 /
-改 grids 或 configurations) 后, 按以下三步验证, 都过了再批量跑:
+方法不变 (最易栽的坑仍是参数名拼错 / shell 拆分错 → LocalProcessor 静默兜底默认值), 只是**核对的参数换成检测面的**:
 
 ```bash
-# 步骤 1: 本地 yaml 解析合法 (上次因缩进栽过, 必做)
+# 步骤 1: 本地 yaml 解析合法
 python3 -c "import yaml; yaml.safe_load(open('deploy/experiment-configs.yml'))" && echo OK
-# 步骤 1.5: scp 到 master
+# 步骤 1.5: scp 到 master + 远端再验
 scp deploy/experiment-configs.yml fa-master:/opt/fa-iforest/repo/deploy/
-ssh fa-master "python3 -c 'import yaml; yaml.safe_load(open(\"/opt/fa-iforest/repo/deploy/experiment-configs.yml\"))' && echo OK_REMOTE"
 
 # 步骤 2: dry-run 核对展开行数 + 每行 extra 列
 ssh fa-master "cd /opt/fa-iforest/repo && bash deploy/scripts/run-batch.sh --plan <plan> --dry-run | head -20"
-# 预期: 展开行数 = 配置点数 × repeats; 每行末尾的 extra 列就是要扫的 k=v[;k2=v2]
 
-# 步骤 3: 单跑 1 次, 核对参数透传到 LocalProcessor (关键防呆)
+# 步骤 3: 单跑 1 次, 核对参数透传到检测面 banner (关键防呆)
 ssh fa-master "cd /opt/fa-iforest/repo && RUN_MODE=local bash deploy/scripts/run-experiment.sh \
     --dataset <ds> --config-id <cfg> --run-id 1 \
-    --extra-param '<和 yaml 里某个点完全相同的字符串>'"
-# 看 LocalProcessor 启动 banner 打出的参数值, 必须等于你设的值, 不能是默认值
-# 比如 warnConfidence=0.05;driftConfidence=0.01 → banner 必须打 Warn confidence: 0.05 / Drift confidence: 0.01
-#      不能是默认 0.005 / 0.001
+    --extra-param 'iksWindowSize=2000;iksPValue=0.001;aggK=2'"
+# banner 必须打 IKS window: 2000 / IKS pValue: 0.001 / aggK: 2, 不能是默认
+#   (旧的 warnConfidence/driftConfidence 已废, 别再核对那两个)
 ```
-
-三步全过 → 才正式 `run-batch.sh --plan <plan>`。
-单跑那次的结果目录与 batch 重复, 让 batch 的断点续跑跳过它即可, 无须特别清理。
 
 ---
 
