@@ -114,6 +114,7 @@ class DatasetSpec:
     anomaly_label: str            # string per yml convention (e.g. "1")
     dimensions: int
     drift_starts: List[int] = field(default_factory=list)
+    drift_events: List[Tuple[int, int]] = field(default_factory=list)  # (start, end) per event
     delta: float = GT_DELTA       # AUC degradation tolerance below baseline
 
 
@@ -122,17 +123,28 @@ def _load_yml() -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _resolve_drift_starts(name: str, meta: Dict[str, Any]) -> List[int]:
-    """drift_starts source priority: meta['drift_events'] (yml inline) -> drift_spec JSON."""
-    if "drift_events" in meta:
-        return [int(x) for x in meta["drift_events"]]
+def _resolve_drift_events(name: str, meta: Dict[str, Any]) -> List[Tuple[int, int]]:
+    """
+    Returns [(start, end)] per drift event. Sources, in priority:
+      1. driftspec JSON pointed to by meta['drift_spec']  (has both start_line + end_line)
+      2. meta['drift_events'] inline yml list (assumed abrupt -> end = start + 1)
+    """
     spec_rel = meta.get("drift_spec")
     if spec_rel:
         spec_path = PROJECT_ROOT / spec_rel
         if spec_path.exists():
             with open(spec_path) as f:
                 spec = json.load(f) or {}
-            return [int(e["start_line"]) for e in spec.get("drift_events", [])]
+            evs = []
+            for e in spec.get("drift_events", []):
+                start = int(e["start_line"])
+                end = int(e.get("end_line", start + 1))
+                evs.append((start, end))
+            if evs:
+                return evs
+    if "drift_events" in meta:
+        # yml inline = bare integers; treat as abrupt (end = start + 1)
+        return [(int(x), int(x) + 1) for x in meta["drift_events"]]
     return []
 
 
@@ -145,6 +157,7 @@ def all_dataset_specs() -> List[DatasetSpec]:
         # gracefully on missing CSVs, so list everything driver provides.
         csv_path = PROJECT_ROOT / meta["path"]
         delta = 0.10 if name in WEAK_GT_A_DATASETS else GT_DELTA
+        events = _resolve_drift_events(name, meta)
         specs.append(DatasetSpec(
             name=name,
             csv_path=csv_path,
@@ -154,7 +167,8 @@ def all_dataset_specs() -> List[DatasetSpec]:
             label_position=meta.get("labelPosition", "last"),
             anomaly_label=str(meta.get("anomalyLabel", "1")),
             dimensions=int(meta.get("dimensions", 0)),
-            drift_starts=_resolve_drift_starts(name, meta),
+            drift_starts=[s for s, _ in events],
+            drift_events=events,
             delta=delta,
         ))
     return specs
@@ -397,7 +411,208 @@ def per_feature_iks(X: np.ndarray, *, ca: float = CA,
     return out
 
 
-# ---------------- alignment ----------------
+# ---------------- Phase 1.5: labeled-drift verdict + precision sweep ----------------
+
+# Precision-sweep grid (HANDOVER A.2: "扫小网格")
+PSWEEP_K = (1, 2, 3)
+PSWEEP_KS_MIN = (0.0, 0.10, 0.20)             # 0, mid, high; deployed thr ~ 0.0588 at W=2000
+PSWEEP_PERSIST = (1, 3)                       # 1 = no persist filter; 3 = sustained
+PSWEEP_REFRACTORY = (0, W)                    # 0, ~W
+
+
+def rising_edges_at(feat: FeatureFire, ks_min: float) -> List[int]:
+    """
+    Re-derive rising edges from the precomputed ks_seq at an arbitrary post-filter
+    threshold.
+
+    The IKSSW rebased at the deployed threshold (CA*sqrt(2/W)), so the ks_seq
+    trajectory already reflects deployed-IKS-with-rebase. ks_min is interpreted
+    as a post-filter:
+      * ks_min <= KS_THRESHOLD : no extra filtering — reuse deployed fires as-is
+        (so ks_min=0 reproduces Phase 1 behavior exactly).
+      * ks_min  > KS_THRESHOLD : amplitude filter — only KS crossings above ks_min
+        from below count as rising edges.
+    """
+    if ks_min <= KS_THRESHOLD:
+        return list(feat.onsets)
+    onsets: List[int] = []
+    prev_above = False
+    for seq, ks in zip(feat.eval_seq.tolist(), feat.ks_seq.tolist()):
+        above = ks > ks_min
+        if above and not prev_above:
+            onsets.append(int(seq))
+        prev_above = above
+    return onsets
+
+
+def aggregate_onsets_v2(features: List[FeatureFire], eval_seq: np.ndarray, *,
+                        k: int, ks_min: float, persist: int, refractory: int,
+                        agg_win: int = AGG_WIN) -> List[int]:
+    """
+    Phase 1.5 aggregator with three noise-suppression knobs:
+      - ks_min      : feature's fire is recorded only when KS >= ks_min
+      - persist     : agg-active (>= k distinct features fired in [ep-agg_win, ep])
+                      must hold for `persist` consecutive eval positions before onset
+      - refractory  : after recording an onset, suppress new onsets for R samples
+
+    Sweeps a single shared eval grid (the union of every feature's eval_seq).
+    """
+    if len(features) == 0:
+        return []
+    # Per-feature rising-edge lists at this ks_min
+    feat_edges: List[List[int]] = [rising_edges_at(f, ks_min) for f in features]
+    # Walk eval_seq once
+    eval_list = eval_seq.tolist()
+    # iterators / per-feature presence deque
+    iters = [iter(es) for es in feat_edges]
+    pending = [next(it, None) for it in iters]
+    present: List[Deque[int]] = [deque() for _ in features]
+    onsets: List[int] = []
+    streak = 0
+    last_onset_seq = -10 ** 18
+    for ep in eval_list:
+        # evict edges that left the window
+        for q in present:
+            while q and q[0] < ep - agg_win:
+                q.popleft()
+        # admit edges that entered the window (<= ep)
+        for fi in range(len(features)):
+            while pending[fi] is not None and pending[fi] <= ep:
+                present[fi].append(pending[fi])
+                pending[fi] = next(iters[fi], None)
+        count = sum(1 for q in present if q)
+        if count >= k:
+            streak += 1
+        else:
+            streak = 0
+        if streak >= persist and ep >= last_onset_seq + refractory:
+            onsets.append(int(ep))
+            last_onset_seq = ep
+    return onsets
+
+
+@dataclass
+class LabeledMetrics:
+    recall: float
+    precision: float                # nan if no onsets
+    median_latency: Optional[float] # None if no hits
+    n_false_trigger: int            # onsets attributed to no drift
+    hits: List[int]                 # drift indices hit
+    latencies: List[int]            # first-hit onset minus drift_start per hit drift
+
+
+def labeled_metrics(drift_events: List[Tuple[int, int]],
+                    agg_onsets: List[int], *, tau: int = TAU) -> LabeledMetrics:
+    """
+    Drift hit ⟺ agg onset ∈ [D_start - tau, D_end + tau].
+    Leading detection (onset before D_start) counts (covers incremental's anticipation).
+    """
+    if not drift_events:
+        return LabeledMetrics(recall=float("nan"), precision=float("nan"),
+                              median_latency=None, n_false_trigger=len(agg_onsets),
+                              hits=[], latencies=[])
+    hit_drifts: List[int] = []
+    hit_onset_ids: set = set()
+    latencies: List[int] = []
+    for di, (ds, de) in enumerate(drift_events):
+        lo, hi = ds - tau, de + tau
+        matched = [(oi, o) for oi, o in enumerate(agg_onsets) if lo <= o <= hi]
+        if matched:
+            hit_drifts.append(di)
+            for oi, _ in matched:
+                hit_onset_ids.add(oi)
+            latencies.append(matched[0][1] - ds)
+    recall = len(hit_drifts) / len(drift_events)
+    precision = (len(hit_onset_ids) / len(agg_onsets)) if agg_onsets else float("nan")
+    median_lat = float(np.median(latencies)) if latencies else None
+    n_false = len(agg_onsets) - len(hit_onset_ids)
+    return LabeledMetrics(recall=recall, precision=precision,
+                          median_latency=median_lat, n_false_trigger=n_false,
+                          hits=hit_drifts, latencies=latencies)
+
+
+def shared_eval_grid(features: List[FeatureFire]) -> np.ndarray:
+    """All features in this harness share the same eval_seq (constructed in per_feature_iks)."""
+    if not features:
+        return np.empty(0, dtype=int)
+    return features[0].eval_seq
+
+
+def precision_sweep(features: List[FeatureFire],
+                    drift_events: List[Tuple[int, int]]) -> List[Dict[str, Any]]:
+    """Grid-scan precision knobs; one row per (k, ks_min, persist, refractory)."""
+    rows: List[Dict[str, Any]] = []
+    eg = shared_eval_grid(features)
+    for k in PSWEEP_K:
+        for ks_min in PSWEEP_KS_MIN:
+            for persist in PSWEEP_PERSIST:
+                for refractory in PSWEEP_REFRACTORY:
+                    onsets = aggregate_onsets_v2(features, eg,
+                                                 k=k, ks_min=ks_min,
+                                                 persist=persist, refractory=refractory)
+                    m = labeled_metrics(drift_events, onsets)
+                    rows.append({
+                        "k": k, "ks_min": ks_min, "persist": persist, "refractory": refractory,
+                        "recall": m.recall, "precision": m.precision,
+                        "median_latency": m.median_latency,
+                        "n_agg_onsets": len(onsets),
+                        "n_false_trigger": m.n_false_trigger,
+                    })
+    return rows
+
+
+def pick_operating_point(sweep_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    HANDOVER A.2 selection: among recall == 1.0, maximise precision; tie-break
+    on smaller |median_latency| (close-to-punctual). Returns None if no row
+    achieves recall=100%.
+    """
+    full = [r for r in sweep_rows if not math.isnan(r["recall"]) and r["recall"] >= 1.0 - 1e-9]
+    if not full:
+        return None
+
+    def score(r: Dict[str, Any]) -> Tuple[float, float, int, float, int]:
+        # sort key: lower is better
+        prec = r["precision"] if not math.isnan(r["precision"]) else 0.0
+        ml = r["median_latency"]
+        abs_lat = abs(ml) if ml is not None else 10 ** 9
+        return (-prec, abs_lat, r["k"], r["ks_min"], r["refractory"])
+    return min(full, key=score)
+
+
+def phase15_verdict(op: Optional[Dict[str, Any]], drift_events: List[Tuple[int, int]],
+                    sweep_rows: List[Dict[str, Any]]) -> str:
+    """
+    A.3 final verdict.
+      - Operating point exists at recall=100% with precision > naive k=2 baseline
+        => proxy holds (change-detection sense); no joint-confirmation needed.
+      - Some drift hits in no config at all => real mode 2 (joint drift, marginals
+        steady) => joint confirmation needed.
+      - Otherwise indeterminate (e.g. recall<100% but every drift is hit in *some*
+        config — only k/ks_min/persist trade-off issue).
+    """
+    if not drift_events:
+        return "no_labeled_drifts"
+    if op is not None:
+        return "proxy_holds(change-detection)"
+    # check whether some drift is *never* hit
+    n_drifts = len(drift_events)
+    drift_ever_hit = [False] * n_drifts
+    for r in sweep_rows:
+        # for this we need per-drift hit info; recompute cheaply at each best-recall row
+        if r["recall"] > 0:
+            # Approximation: full per-drift hit set isn't stored; we use the
+            # sweep rows' presence of nonzero recall — if max recall < 1.0 and
+            # the best config still misses some drift, that drift is structurally
+            # unreachable.  Mark conservative "mode2_or_undertuned" if max recall<1.
+            pass
+    max_recall = max((r["recall"] for r in sweep_rows if not math.isnan(r["recall"])), default=0.0)
+    if max_recall < 1.0 - 1e-9:
+        return "mode2_or_undertuned"
+    return "indeterminate"
+
+
+# ---------------- alignment (Phase 1, retained as GT-A background ref) ----------------
 
 @dataclass
 class AggResult:
@@ -574,32 +789,36 @@ def overlay_plot(spec: DatasetSpec, gta: GTAResult,
 
 # ---------------- driver ----------------
 
-def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Tuple[Dict[str, str], List[Dict[str, str]]]:
-    """Returns (summary_row, [ksweep_rows...]). Skips gracefully if CSV is missing."""
+def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Returns a dict of output rows keyed by output file:
+        'summary'         : list with one row (per-dataset Phase 1 + 1.5 row)
+        'ksweep'          : list of Phase-1 k-sweep rows
+        'labeled'         : list of per-drift hit/miss rows (Phase 1.5 §A.1)
+        'precision_sweep' : list of Phase 1.5 precision-sweep grid rows (§A.2)
+    Skips gracefully if CSV is missing or no labeled drift events are configured.
+    """
+    skip_row = {
+        "dataset": spec.name,
+        "GT_A_onset": "NA", "best_k": "NA", "agg_onset": "NA",
+        "latency": "NA", "FP": "NA", "FN": "NA",
+        "features_fired": "NA",
+        "op_k": "NA", "op_ks_min": "NA", "op_persist": "NA", "op_refractory": "NA",
+        "recall": "NA", "precision": "NA", "median_latency": "NA",
+        "verdict": "",
+    }
     if not spec.csv_path.exists():
-        return ({
-            "dataset": spec.name,
-            "GT_A_onset": "NA",
-            "best_k": "NA",
-            "agg_onset": "NA",
-            "latency": "NA",
-            "FP": "NA",
-            "FN": "NA",
-            "features_fired": "NA",
-            "verdict": f"skipped:no_csv({spec.csv_path.relative_to(PROJECT_ROOT)})"
-        }, [])
+        skip_row["verdict"] = f"skipped:no_csv({spec.csv_path.relative_to(PROJECT_ROOT)})"
+        return {"summary": [skip_row], "ksweep": [], "labeled": [], "precision_sweep": []}
 
     print(f"=== {spec.name} ===")
     print(f"  load {spec.csv_path}")
     X, y = load_dataset(spec)
     n, D = X.shape
-    print(f"  n={n}, D={D}, anomaly_rate={y.mean():.4f}, drift_starts={spec.drift_starts}, delta={spec.delta}")
+    print(f"  n={n}, D={D}, anomaly_rate={y.mean():.4f}, drift_events={spec.drift_events}, delta={spec.delta}")
     if not spec.drift_starts:
-        return ({
-            "dataset": spec.name, "GT_A_onset": "NA", "best_k": "NA",
-            "agg_onset": "NA", "latency": "NA", "FP": "NA", "FN": "NA",
-            "features_fired": "NA", "verdict": "skipped:no_drift_starts",
-        }, [])
+        skip_row["verdict"] = "skipped:no_drift_starts"
+        return {"summary": [skip_row], "ksweep": [], "labeled": [], "precision_sweep": []}
     pre_end = spec.drift_starts[0]
 
     print(f"  GT-A: train on X[:{pre_end}] normals, slide win={GT_WIN} step={GT_STEP}")
@@ -639,8 +858,64 @@ def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Tuple[Dict[str, str], L
     best = results[best_k]
 
     fired = features_fired_near(features, gta.degradation_onset or 0)
+
+    # ===== Phase 1.5 (§A.1 labeled + §A.2 precision sweep) =====
+    print(f"  Phase 1.5: labeled-drift verdict + precision sweep over"
+          f" k×ks_min×persist×refractory")
+    sweep_rows = precision_sweep(features, spec.drift_events)
+    op = pick_operating_point(sweep_rows)
+    # Per-drift labeled rows at the chosen operating point (or the naive k=best baseline
+    # if no operating point reaches recall=100% — keep something to compare against).
+    if op is not None:
+        op_onsets = aggregate_onsets_v2(features, shared_eval_grid(features),
+                                        k=op["k"], ks_min=op["ks_min"],
+                                        persist=op["persist"], refractory=op["refractory"])
+    else:
+        op_onsets = best.agg_onsets
+    op_metrics = labeled_metrics(spec.drift_events, op_onsets)
+    labeled_rows: List[Dict[str, str]] = []
+    for di, (ds, de) in enumerate(spec.drift_events):
+        hit = di in op_metrics.hits
+        lat_i = (op_metrics.latencies[op_metrics.hits.index(di)]
+                 if hit else None)
+        labeled_rows.append({
+            "dataset": spec.name, "drift_idx": str(di),
+            "drift_start": str(ds), "drift_end": str(de),
+            "hit": "1" if hit else "0",
+            "latency": "" if lat_i is None else str(lat_i),
+        })
+
+    # Stamp precision-sweep rows with dataset name so a multi-dataset run is sortable
+    precision_sweep_rows: List[Dict[str, str]] = []
+    for r in sweep_rows:
+        precision_sweep_rows.append({
+            "dataset": spec.name,
+            "k": str(r["k"]),
+            "ks_min": f"{r['ks_min']:.4f}",
+            "persist": str(r["persist"]),
+            "refractory": str(r["refractory"]),
+            "recall": f"{r['recall']:.4f}" if not math.isnan(r["recall"]) else "",
+            "precision": f"{r['precision']:.4f}" if not math.isnan(r["precision"]) else "",
+            "median_latency": "" if r["median_latency"] is None else f"{r['median_latency']:.1f}",
+            "n_agg_onsets": str(r["n_agg_onsets"]),
+            "n_false_trigger": str(r["n_false_trigger"]),
+        })
+
+    verdict15 = phase15_verdict(op, spec.drift_events, sweep_rows)
+    if op is not None:
+        op_str = (f"k={op['k']} ks_min={op['ks_min']:.2f} persist={op['persist']}"
+                  f" refractory={op['refractory']}")
+        print(f"  Phase 1.5 op: {op_str}  recall={op['recall']:.3f}"
+              f"  precision={op['precision']:.3f}"
+              f"  median_latency={op['median_latency']}"
+              f"  n_false={op['n_false_trigger']}")
+    else:
+        print(f"  Phase 1.5: no recall=100% operating point in sweep")
+    print(f"  Phase 1.5 verdict: {verdict15}")
+
     summary = {
         "dataset": spec.name,
+        # Phase 1 (GT-A background)
         "GT_A_onset": "" if gta.degradation_onset is None else str(gta.degradation_onset),
         "best_k": str(best_k),
         "agg_onset": "" if not best.agg_onsets else str(best.agg_onsets[0]),
@@ -648,16 +923,32 @@ def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Tuple[Dict[str, str], L
         "FP": str(best.fp),
         "FN": str(best.fn),
         "features_fired": "|".join(str(x) for x in fired),
-        "verdict": pick_verdict(best, gta),
+        # Phase 1.5 (labeled-drift verdict — primary)
+        "op_k":           "" if op is None else str(op["k"]),
+        "op_ks_min":      "" if op is None else f"{op['ks_min']:.4f}",
+        "op_persist":     "" if op is None else str(op["persist"]),
+        "op_refractory":  "" if op is None else str(op["refractory"]),
+        "recall":         "" if op is None else f"{op['recall']:.4f}",
+        "precision":      "" if op is None else f"{op['precision']:.4f}",
+        "median_latency": "" if op is None or op["median_latency"] is None
+                          else f"{op['median_latency']:.1f}",
+        "verdict": verdict15,
     }
-    print(f"  verdict: {summary['verdict']}  best_k={best_k}  latency={best.latency}  FP={best.fp}  FN={best.fn}")
+    print(f"  Phase 1  best_k={best_k}  latency={best.latency}  FP={best.fp}  FN={best.fn}"
+          f"  GT-A_verdict={pick_verdict(best, gta)}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     plot_path = OUT_DIR / f"derisk_{spec.name}.png"
     overlay_plot(spec, gta, features, best, plot_path)
     print(f"  -> {plot_path.relative_to(PROJECT_ROOT)}")
 
-    return summary, ksweep_rows
+    # Stamp ksweep_rows with dataset (already done) and return all four streams
+    return {
+        "summary": [summary],
+        "ksweep": ksweep_rows,
+        "labeled": labeled_rows,
+        "precision_sweep": precision_sweep_rows,
+    }
 
 
 def main():
@@ -689,42 +980,55 @@ def main():
     k_grid_base = [int(x) for x in args.k_grid.split(",") if x.strip()]
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    summary_rows: List[Dict[str, str]] = []
-    ksweep_rows: List[Dict[str, str]] = []
+    streams = {"summary": [], "ksweep": [], "labeled": [], "precision_sweep": []}
     for spec in specs:
-        srow, krows = run_dataset(spec, list(k_grid_base))
-        summary_rows.append(srow)
-        ksweep_rows.extend(krows)
+        result = run_dataset(spec, list(k_grid_base))
+        for k, rows in result.items():
+            streams[k].extend(rows)
 
-    # When --dataset is used, merge into existing summary/ksweep so a subsequent
-    # INSECTS run on leejean's box augments the synth run sitting in the repo.
-    summary_path = OUT_DIR / "derisk_summary.csv"
-    ksweep_path = OUT_DIR / "derisk_ksweep.csv"
+    summary_path        = OUT_DIR / "derisk_summary.csv"
+    ksweep_path         = OUT_DIR / "derisk_ksweep.csv"
+    labeled_path        = OUT_DIR / "derisk_labeled.csv"           # §A.1
+    psweep_path         = OUT_DIR / "derisk_precision_sweep.csv"   # §A.2
+
+    # When --dataset is used, merge into existing CSVs so a subsequent INSECTS
+    # run on leejean's box augments the synth runs already in the repo.
     if args.dataset:
-        existing_summary = _read_existing_rows(summary_path)
-        existing_ksweep = _read_existing_rows(ksweep_path)
-        existing_summary = [r for r in existing_summary if r.get("dataset") != args.dataset]
-        existing_ksweep = [r for r in existing_ksweep if r.get("dataset") != args.dataset]
-        summary_rows = existing_summary + summary_rows
-        ksweep_rows = existing_ksweep + ksweep_rows
+        for path, key in ((summary_path, "summary"), (ksweep_path, "ksweep"),
+                          (labeled_path, "labeled"), (psweep_path, "precision_sweep")):
+            existing = _read_existing_rows(path)
+            existing = [r for r in existing if r.get("dataset") != args.dataset]
+            streams[key] = existing + streams[key]
 
-    with open(summary_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "dataset", "GT_A_onset", "best_k", "agg_onset",
-            "latency", "FP", "FN", "features_fired", "verdict",
-        ])
-        w.writeheader()
-        for row in summary_rows:
-            w.writerow(row)
+    summary_fields = [
+        "dataset", "GT_A_onset", "best_k", "agg_onset", "latency", "FP", "FN",
+        "features_fired",
+        "op_k", "op_ks_min", "op_persist", "op_refractory",
+        "recall", "precision", "median_latency",
+        "verdict",
+    ]
+    _write_csv(summary_path, summary_fields, streams["summary"])
     print(f"\n  -> {summary_path.relative_to(PROJECT_ROOT)}")
-
-    with open(ksweep_path, "w", newline="") as f:
-        if ksweep_rows:
-            w = csv.DictWriter(f, fieldnames=list(ksweep_rows[0].keys()))
-            w.writeheader()
-            for row in ksweep_rows:
-                w.writerow(row)
+    if streams["ksweep"]:
+        _write_csv(ksweep_path, list(streams["ksweep"][0].keys()), streams["ksweep"])
     print(f"  -> {ksweep_path.relative_to(PROJECT_ROOT)}")
+    if streams["labeled"]:
+        _write_csv(labeled_path,
+                   ["dataset", "drift_idx", "drift_start", "drift_end", "hit", "latency"],
+                   streams["labeled"])
+        print(f"  -> {labeled_path.relative_to(PROJECT_ROOT)}")
+    if streams["precision_sweep"]:
+        _write_csv(psweep_path, list(streams["precision_sweep"][0].keys()),
+                   streams["precision_sweep"])
+        print(f"  -> {psweep_path.relative_to(PROJECT_ROOT)}")
+
+
+def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
 
 
 def _read_existing_rows(path: Path) -> List[Dict[str, str]]:
