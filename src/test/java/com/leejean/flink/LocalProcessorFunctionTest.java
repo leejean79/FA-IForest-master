@@ -23,11 +23,18 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * LocalProcessorFunction MiniCluster 集成测试
- * LocalProcessorFunction MiniCluster integration test
+ * LocalProcessorFunction MiniCluster 集成测试（方向二(a) Phase 3）。
+ * Scoring-side only — detection lives on a separate column-parallel pipeline
+ * and is exercised by its own tests (FeatureSplit / PerFeatureIKS / Aggregator).
  *
- * 场景 A-C: v2.1 三阶段状态机 / v2.1 three-phase state machine
- * 场景 D-H: v3.0 Phase C 漂移检测子状态机 / v3.0 Phase C drift detection sub-state machine
+ * <p>场景：
+ * <ul>
+ *   <li>A/B/C：三阶段状态机（Phase B 训树 / Phase A 排空 / Phase C 打分）</li>
+ *   <li>D：Phase C 稳定数据 — 无 detector，仅打分</li>
+ *   <li>E：COMMITTED 广播 → COOLDOWN → 重训 → WAITING → STABLE</li>
+ *   <li>H：BACKLOG_THEN_NEW_FOREST 模式下 COMMITTED 后数据进 backlog</li>
+ *   <li>R1/R3：环形缓冲容量边界</li>
+ * </ul>
  */
 public class LocalProcessorFunctionTest {
 
@@ -35,7 +42,6 @@ public class LocalProcessorFunctionTest {
     public void setUp() {
         ScoreSink.values.clear();
         TreeSink.values.clear();
-        DriftReportSink.values.clear();
     }
 
     // ===== 场景 A: 纯 Phase B（无广播 → 等同 v1，只产树不产分数）=====
@@ -279,10 +285,6 @@ public class LocalProcessorFunctionTest {
             put("subsampleSize", String.valueOf(subsampleSize));
             put("totalTrees", String.valueOf(totalTrees));
             put("seed", "42");
-            put("warnConfidence", "0.1");
-            put("driftConfidence", "0.05");
-            put("warnTimeoutSamples", "10000");
-            put("warnTimeoutBehavior", "DISCARD");
         }});
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -329,109 +331,25 @@ public class LocalProcessorFunctionTest {
         }
     }
 
-    // ===== v3.4 场景 E: STABLE → WARN → DRIFT → LOCAL_DRIFT_REPORTED =====
-    // Scenario E: STABLE → WARN → DRIFT → LOCAL_DRIFT_REPORTED (emits DriftReport INITIATE)
+    // ===== 场景 E: COMMITTED 广播 → COOLDOWN → 重训 → WAITING → STABLE =====
+    // Scenario E: COMMITTED broadcast drives COOLDOWN → retrain → WAITING → STABLE.
 
     @Test
-    public void testDriftTriggersLocalDriftReported() throws Exception {
+    public void testCommittedTriggersCooldownAndRetrain() throws Exception {
         int parallelism = 1;
         int totalTrees = 2;
         int subsampleSize = 32;
-        int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
-
-        ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
-            put("subsampleSize", String.valueOf(subsampleSize));
-            put("totalTrees", String.valueOf(totalTrees));
-            put("seed", "42");
-            put("warnConfidence", "0.1");
-            put("driftConfidence", "0.05");
-            put("warnTimeoutSamples", "10000");
-            put("warnTimeoutBehavior", "DISCARD");
-        }});
-
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(parallelism);
-        env.setMaxParallelism(maxParallelism);
-        env.setRestartStrategy(RestartStrategies.noRestart());
-        env.getConfig().setGlobalJobParameters(params);
-
-        // 前 3000 条稳定 + 后 3000 条漂移
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(3000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(3000, 9, 5000.0, 10.0, 100, 3000));
-
-        DataStream<DataPoint> source = env.fromCollection(data);
-
-        final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
-        KeyedStream<DataPoint, String> keyedStream = source.keyBy(
-                (KeySelector<DataPoint, String>) dp ->
-                        keys[Math.abs(dp.getId().hashCode() % keys.length)]);
-
-        ForestMessage mockForest = buildMockForest(9, 1L);
-        DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(
-                Collections.singletonList(BroadcastEnvelope.forest(mockForest)));
-        BroadcastStream<BroadcastEnvelope> broadcastStream =
-                envelopeStream.broadcast(LocalProcessorFunction.FOREST_DESC, LocalProcessorFunction.DRIFT_ROUND_DESC);
-
-        SingleOutputStreamOperator<ScoreResult> processed = keyedStream
-                .connect(broadcastStream)
-                .process(new LocalProcessorFunction())
-                .name("Local Processor");
-
-        processed.addSink(new ScoreSink());
-        processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-        processed.getSideOutput(LocalProcessorFunction.DRIFT_REPORT_TAG).addSink(new DriftReportSink());
-
-        env.execute("Scenario E: drift triggers LOCAL_DRIFT_REPORTED");
-
-        // v3.4: DRIFT → LOCAL_DRIFT_REPORTED，不再直接重训
-        // USE_OLD_FOREST 默认：继续用旧森林打分输出
-        assertFalse(ScoreSink.values.isEmpty(), "Should have score outputs (USE_OLD_FOREST)");
-
-        boolean hasPhaseCScores = false;
-        for (ScoreResult sr : ScoreSink.values) {
-            assertTrue(sr.getScore() >= 0 && sr.getScore() <= 1,
-                    "Score should be in [0,1], got " + sr.getScore());
-            if ("C".equals(sr.getPhase())) {
-                hasPhaseCScores = true;
-            }
-        }
-        assertTrue(hasPhaseCScores, "Should have Phase C scores");
-
-        // 应有 DriftReport{INITIATE} side output
-        assertFalse(DriftReportSink.values.isEmpty(),
-                "Should have DriftReport INITIATE side output");
-        boolean hasInitiate = false;
-        for (DriftReport dr : DriftReportSink.values) {
-            if (dr.getVote() == DriftReport.DriftVote.INITIATE) {
-                hasInitiate = true;
-            }
-        }
-        assertTrue(hasInitiate, "Should have at least one INITIATE DriftReport");
-    }
-
-    // ===== v3.0 场景 F: WARN timeout DISCARD =====
-    // Scenario F: WARN timeout DISCARD — warn triggers but times out, candidates discarded
-
-    @Test
-    public void testWarnTimeoutDiscard() throws Exception {
-        int parallelism = 1;
-        int totalTrees = 2;
-        int subsampleSize = 32;
+        int ringBufferSize = 200;
+        int cooldownSamples = 300;
         int localTreeCount = (int) Math.ceil((double) totalTrees / parallelism);
         int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
 
-        // warnConfidence=0.5（宽松 WARN）, driftConfidence=0.0001（极严格 DRIFT）
-        // warnTimeoutSamples=2：WARN 后 2 样本即 timeout
-        // Wide WARN zone, strict DRIFT → WARN triggers but DRIFT unlikely in 2 samples
         ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
             put("subsampleSize", String.valueOf(subsampleSize));
             put("totalTrees", String.valueOf(totalTrees));
+            put("ringBufferSize", String.valueOf(ringBufferSize));
+            put("cooldownSamples", String.valueOf(cooldownSamples));
             put("seed", "42");
-            put("warnConfidence", "0.5");
-            put("driftConfidence", "0.0001");
-            put("warnTimeoutSamples", "2");
-            put("warnTimeoutBehavior", "DISCARD");
         }});
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -440,11 +358,8 @@ public class LocalProcessorFunctionTest {
         env.setRestartStrategy(RestartStrategies.noRestart());
         env.getConfig().setGlobalJobParameters(params);
 
-        // 稳定数据 + 漂移数据 / stable + drifted
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(2000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(2000, 9, 5000.0, 10.0, 100, 2000));
-
+        // 稳定数据，足够让 COOLDOWN 满足终止条件并触发重训
+        List<DataPoint> data = generateDataWithMean(2000, 9, 50.0, 10.0, 99, 0);
         DataStream<DataPoint> source = env.fromCollection(data);
 
         final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
@@ -452,209 +367,14 @@ public class LocalProcessorFunctionTest {
                 (KeySelector<DataPoint, String>) dp ->
                         keys[Math.abs(dp.getId().hashCode() % keys.length)]);
 
+        // 广播：森林 v1 + COMMITTED(roundId=7)
         ForestMessage mockForest = buildMockForest(9, 1L);
-        DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(
-                Collections.singletonList(BroadcastEnvelope.forest(mockForest)));
-        BroadcastStream<BroadcastEnvelope> broadcastStream =
-                envelopeStream.broadcast(LocalProcessorFunction.FOREST_DESC, LocalProcessorFunction.DRIFT_ROUND_DESC);
-
-        SingleOutputStreamOperator<ScoreResult> processed = keyedStream
-                .connect(broadcastStream)
-                .process(new LocalProcessorFunction())
-                .name("Local Processor");
-
-        processed.addSink(new ScoreSink());
-        processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-
-        env.execute("Scenario F: WARN timeout DISCARD");
-
-        // DISCARD：超时丢弃候选树，不产额外树
-        // DISCARD: timeout discards candidates, no extra trees
-        assertTrue(TreeSink.values.size() <= localTreeCount,
-                "DISCARD should produce at most " + localTreeCount
-                        + " Phase B trees, got " + TreeSink.values.size());
-
-        assertFalse(ScoreSink.values.isEmpty(), "Should have score outputs");
-    }
-
-    // ===== v3.4 场景 G: WARN timeout PROMOTE → LOCAL_DRIFT_REPORTED =====
-    // Scenario G: WARN timeout PROMOTE → enters LOCAL_DRIFT_REPORTED (emits INITIATE)
-
-    @Test
-    public void testWarnTimeoutPromote() throws Exception {
-        int parallelism = 1;
-        int totalTrees = 2;
-        int subsampleSize = 32;
-        int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
-
-        // warnConfidence=0.5, driftConfidence=0.0001, warnTimeoutSamples=500
-        // v3.4: PROMOTE → LOCAL_DRIFT_REPORTED
-        ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
-            put("subsampleSize", String.valueOf(subsampleSize));
-            put("totalTrees", String.valueOf(totalTrees));
-            put("seed", "42");
-            put("warnConfidence", "0.5");
-            put("driftConfidence", "0.0001");
-            put("warnTimeoutSamples", "500");
-            put("warnTimeoutBehavior", "PROMOTE");
-        }});
-
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(parallelism);
-        env.setMaxParallelism(maxParallelism);
-        env.setRestartStrategy(RestartStrategies.noRestart());
-        env.getConfig().setGlobalJobParameters(params);
-
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(2000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(4000, 9, 5000.0, 10.0, 100, 2000));
-
-        DataStream<DataPoint> source = env.fromCollection(data);
-
-        final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
-        KeyedStream<DataPoint, String> keyedStream = source.keyBy(
-                (KeySelector<DataPoint, String>) dp ->
-                        keys[Math.abs(dp.getId().hashCode() % keys.length)]);
-
-        ForestMessage mockForest = buildMockForest(9, 1L);
-        DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(
-                Collections.singletonList(BroadcastEnvelope.forest(mockForest)));
-        BroadcastStream<BroadcastEnvelope> broadcastStream =
-                envelopeStream.broadcast(LocalProcessorFunction.FOREST_DESC, LocalProcessorFunction.DRIFT_ROUND_DESC);
-
-        SingleOutputStreamOperator<ScoreResult> processed = keyedStream
-                .connect(broadcastStream)
-                .process(new LocalProcessorFunction())
-                .name("Local Processor");
-
-        processed.addSink(new ScoreSink());
-        processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-        processed.getSideOutput(LocalProcessorFunction.DRIFT_REPORT_TAG).addSink(new DriftReportSink());
-
-        env.execute("Scenario G: WARN timeout PROMOTE → LOCAL_DRIFT_REPORTED");
-
-        // v3.4: PROMOTE → LOCAL_DRIFT_REPORTED → 不重训（等投票决议）
-        assertFalse(ScoreSink.values.isEmpty(), "Should have score outputs");
-
-        // 应有 DriftReport{INITIATE} side output
-        assertFalse(DriftReportSink.values.isEmpty(),
-                "PROMOTE should emit DriftReport INITIATE");
-    }
-
-    // ===== v3.4 场景 H: BACKLOG_THEN_NEW_FOREST 模式 =====
-    // Scenario H (V34-8): BACKLOG_THEN_NEW_FOREST — drift causes backlog, no score output after drift
-
-    @Test
-    public void testBacklogModeNoScoresDuringDrift() throws Exception {
-        int parallelism = 1;
-        int totalTrees = 2;
-        int subsampleSize = 32;
-        int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
-
-        ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
-            put("subsampleSize", String.valueOf(subsampleSize));
-            put("totalTrees", String.valueOf(totalTrees));
-            put("seed", "42");
-            put("warnConfidence", "0.1");
-            put("driftConfidence", "0.05");
-            put("warnTimeoutSamples", "10000");
-            put("warnTimeoutBehavior", "DISCARD");
-            put("pauseMode", "BACKLOG_THEN_NEW_FOREST");
-        }});
-
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(parallelism);
-        env.setMaxParallelism(maxParallelism);
-        env.setRestartStrategy(RestartStrategies.noRestart());
-        env.getConfig().setGlobalJobParameters(params);
-
-        // 前 3000 条稳定 + 后 3000 条漂移
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(3000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(3000, 9, 5000.0, 10.0, 100, 3000));
-
-        DataStream<DataPoint> source = env.fromCollection(data);
-
-        final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
-        KeyedStream<DataPoint, String> keyedStream = source.keyBy(
-                (KeySelector<DataPoint, String>) dp ->
-                        keys[Math.abs(dp.getId().hashCode() % keys.length)]);
-
-        ForestMessage mockForest = buildMockForest(9, 1L);
-        DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(
-                Collections.singletonList(BroadcastEnvelope.forest(mockForest)));
-        BroadcastStream<BroadcastEnvelope> broadcastStream =
-                envelopeStream.broadcast(LocalProcessorFunction.FOREST_DESC, LocalProcessorFunction.DRIFT_ROUND_DESC);
-
-        SingleOutputStreamOperator<ScoreResult> processed = keyedStream
-                .connect(broadcastStream)
-                .process(new LocalProcessorFunction())
-                .name("Local Processor");
-
-        processed.addSink(new ScoreSink());
-        processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-        processed.getSideOutput(LocalProcessorFunction.DRIFT_REPORT_TAG).addSink(new DriftReportSink());
-
-        env.execute("Scenario H (V34-8): BACKLOG_THEN_NEW_FOREST");
-
-        // BACKLOG 模式：DRIFT 后的数据进 backlog，不输出
-        // 总输出 < 总数据量（drift 后的数据被 backlog 而非输出）
-        assertFalse(ScoreSink.values.isEmpty(), "Should have scores before drift");
-        assertTrue(ScoreSink.values.size() < 6000,
-                "BACKLOG mode should produce fewer scores than total data, got " + ScoreSink.values.size());
-
-        // 应有 DriftReport{INITIATE}
-        assertFalse(DriftReportSink.values.isEmpty(), "Should have INITIATE drift report");
-    }
-
-    // ===== v3.4 场景 V34-9: VOTING 广播触发投票 =====
-    // Scenario V34-9: VOTING broadcast triggers vote
-
-    @Test
-    public void testVotingBroadcastTriggersVote() throws Exception {
-        int parallelism = 1;
-        int totalTrees = 2;
-        int subsampleSize = 32;
-        int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
-
-        // 宽松 WARN 但极严格 DRIFT → 容易进 WARN 但不容易进 DRIFT
-        // Easy WARN, hard DRIFT → subtask stays in WARN when VOTING arrives
-        ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
-            put("subsampleSize", String.valueOf(subsampleSize));
-            put("totalTrees", String.valueOf(totalTrees));
-            put("seed", "42");
-            put("warnConfidence", "0.5");       // 宽松 WARN
-            put("driftConfidence", "0.0001");   // 极严格 DRIFT
-            put("warnTimeoutSamples", "100000");
-            put("warnTimeoutBehavior", "DISCARD");
-        }});
-
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(parallelism);
-        env.setMaxParallelism(maxParallelism);
-        env.setRestartStrategy(RestartStrategies.noRestart());
-        env.getConfig().setGlobalJobParameters(params);
-
-        // 稳定 + 漂移数据：HDDM 进 WARN 但不到 DRIFT
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(2000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(3000, 9, 5000.0, 10.0, 100, 2000));
-
-        DataStream<DataPoint> source = env.fromCollection(data);
-
-        final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
-        KeyedStream<DataPoint, String> keyedStream = source.keyBy(
-                (KeySelector<DataPoint, String>) dp ->
-                        keys[Math.abs(dp.getId().hashCode() % keys.length)]);
-
-        // 广播：森林 + VOTING 消息（模拟其他 subtask 触发的投票请求）
-        ForestMessage mockForest = buildMockForest(9, 1L);
-        DriftRoundMessage votingMsg = new DriftRoundMessage(1L, System.currentTimeMillis(),
-                DriftRoundMessage.RoundStatus.VOTING, 1, 0, 0);
+        DriftRoundMessage committedMsg = new DriftRoundMessage(7L, System.currentTimeMillis(),
+                DriftRoundMessage.RoundStatus.COMMITTED, 2, 0, 0);
 
         List<BroadcastEnvelope> broadcastData = new ArrayList<>();
         broadcastData.add(BroadcastEnvelope.forest(mockForest));
-        broadcastData.add(BroadcastEnvelope.driftRound(votingMsg));
+        broadcastData.add(BroadcastEnvelope.driftRound(committedMsg));
 
         DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(broadcastData);
         BroadcastStream<BroadcastEnvelope> broadcastStream =
@@ -667,44 +387,37 @@ public class LocalProcessorFunctionTest {
 
         processed.addSink(new ScoreSink());
         processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-        processed.getSideOutput(LocalProcessorFunction.DRIFT_REPORT_TAG).addSink(new DriftReportSink());
 
-        env.execute("Scenario V34-9: VOTING broadcast triggers vote");
+        env.execute("Scenario E: COMMITTED triggers COOLDOWN + retrain");
 
         assertFalse(ScoreSink.values.isEmpty(), "Should have score outputs");
 
-        // 在 WARN 状态收到 VOTING → 应投 YES
-        // 但因 MiniCluster 调度不确定，VOTING 可能在 STABLE 时到达 → 投 NO
-        // 关键验证：有投票 side output（非 INITIATE）
-        boolean hasVoteResponse = false;
-        for (DriftReport dr : DriftReportSink.values) {
-            if (dr.getVote() == DriftReport.DriftVote.YES || dr.getVote() == DriftReport.DriftVote.NO) {
-                hasVoteResponse = true;
-                assertEquals(1L, dr.getRoundId(), "Vote should reference roundId=1");
-            }
+        // COMMITTED → COOLDOWN → 终止条件满足 → 重训：batchId 低 32 位 = roundId=7
+        long expectedBatchId = ((long) 0 << 32) | 7L;
+        int retrainTrees = 0;
+        for (ITreeMessage msg : TreeSink.values) {
+            if (msg.getBatchId() == expectedBatchId) retrainTrees++;
         }
-        assertTrue(hasVoteResponse, "Should have a vote response (YES or NO) for VOTING broadcast");
+        assertTrue(retrainTrees >= localTreeCount,
+                "COMMITTED should drive retrain batch (batchId=" + expectedBatchId
+                        + ", localTreeCount=" + localTreeCount + ") got " + retrainTrees);
     }
 
-    // ===== v3.4 场景 V34-10: 投票否决 → STABLE =====
-    // Scenario V34-10: ABORTED vote → back to STABLE, HDDM reset, backlog drained (BACKLOG mode)
+    // ===== 场景 H: BACKLOG_THEN_NEW_FOREST 模式 — COMMITTED 后数据进 backlog =====
+    // Scenario H: BACKLOG mode — after COMMITTED, COOLDOWN/WAITING points go to backlog
+    // (not emitted as scores) until a new forest drains them.
 
     @Test
-    public void testVoteAbortedReturnsToStable() throws Exception {
+    public void testBacklogModeDeferredOnCommitted() throws Exception {
         int parallelism = 1;
         int totalTrees = 2;
         int subsampleSize = 32;
         int maxParallelism = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
 
-        // BACKLOG 模式 + 容易触发 DRIFT
         ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
             put("subsampleSize", String.valueOf(subsampleSize));
             put("totalTrees", String.valueOf(totalTrees));
             put("seed", "42");
-            put("warnConfidence", "0.1");
-            put("driftConfidence", "0.05");
-            put("warnTimeoutSamples", "10000");
-            put("warnTimeoutBehavior", "DISCARD");
             put("pauseMode", "BACKLOG_THEN_NEW_FOREST");
         }});
 
@@ -714,11 +427,7 @@ public class LocalProcessorFunctionTest {
         env.setRestartStrategy(RestartStrategies.noRestart());
         env.getConfig().setGlobalJobParameters(params);
 
-        // 前 3000 稳定 + 后 3000 漂移（触发 DRIFT → LOCAL_DRIFT_REPORTED → backlog）
-        List<DataPoint> data = new ArrayList<>();
-        data.addAll(generateDataWithMean(3000, 9, 50.0, 10.0, 99, 0));
-        data.addAll(generateDataWithMean(3000, 9, 5000.0, 10.0, 100, 3000));
-
+        List<DataPoint> data = generateDataWithMean(2000, 9, 50.0, 10.0, 99, 0);
         DataStream<DataPoint> source = env.fromCollection(data);
 
         final String[] keys = ParallelismKeys.generate(parallelism, maxParallelism);
@@ -726,17 +435,13 @@ public class LocalProcessorFunctionTest {
                 (KeySelector<DataPoint, String>) dp ->
                         keys[Math.abs(dp.getId().hashCode() % keys.length)]);
 
-        // 广播：森林 + VOTING(roundId=1) + ABORTED(roundId=1)
         ForestMessage mockForest = buildMockForest(9, 1L);
-        DriftRoundMessage votingMsg = new DriftRoundMessage(1L, System.currentTimeMillis(),
-                DriftRoundMessage.RoundStatus.VOTING, 1, 0, 0);
-        DriftRoundMessage abortedMsg = new DriftRoundMessage(1L, System.currentTimeMillis(),
-                DriftRoundMessage.RoundStatus.ABORTED, 1, 3, 0);
+        DriftRoundMessage committedMsg = new DriftRoundMessage(1L, System.currentTimeMillis(),
+                DriftRoundMessage.RoundStatus.COMMITTED, 2, 0, 0);
 
         List<BroadcastEnvelope> broadcastData = new ArrayList<>();
         broadcastData.add(BroadcastEnvelope.forest(mockForest));
-        broadcastData.add(BroadcastEnvelope.driftRound(votingMsg));
-        broadcastData.add(BroadcastEnvelope.driftRound(abortedMsg));
+        broadcastData.add(BroadcastEnvelope.driftRound(committedMsg));
 
         DataStream<BroadcastEnvelope> envelopeStream = env.fromCollection(broadcastData);
         BroadcastStream<BroadcastEnvelope> broadcastStream =
@@ -749,31 +454,16 @@ public class LocalProcessorFunctionTest {
 
         processed.addSink(new ScoreSink());
         processed.getSideOutput(LocalProcessorFunction.TREE_TAG).addSink(new TreeSink());
-        processed.getSideOutput(LocalProcessorFunction.DRIFT_REPORT_TAG).addSink(new DriftReportSink());
 
-        env.execute("Scenario V34-10: vote ABORTED → STABLE");
+        env.execute("Scenario H: BACKLOG mode after COMMITTED");
 
-        // ABORTED 后用旧森林排空 backlog → 所有数据都应有 score 输出
-        // After ABORTED, backlog drained with old forest → all data should have scores
-        assertFalse(ScoreSink.values.isEmpty(), "Should have score outputs");
-
-        // ABORTED 后回到 STABLE → 继续正常输出（无 COOLDOWN 重训树）
-        // 验证：Phase B 树 + 无 COOLDOWN 额外树
-        int phaseBTreeCount = (int) Math.ceil((double) totalTrees / parallelism);
-        assertTrue(TreeSink.values.size() <= phaseBTreeCount,
-                "ABORTED should not produce retrain trees, got " + TreeSink.values.size());
-
-        // v3.4.4: DriftReport 应含 INITIATE 或 YES（取决于 MiniCluster 数据/广播交错顺序）
-        // v3.4.4: DriftReport should contain INITIATE or YES (depends on MiniCluster interleaving)
-        boolean hasVoteActivity = false;
-        for (DriftReport dr : DriftReportSink.values) {
-            if (dr.getVote() == DriftReport.DriftVote.INITIATE
-                    || dr.getVote() == DriftReport.DriftVote.YES) {
-                hasVoteActivity = true;
-            }
-        }
-        assertTrue(hasVoteActivity, "Should have INITIATE or YES DriftReport");
+        // BACKLOG 模式下 COMMITTED 之后的 COOLDOWN/WAITING 期数据进 backlog → 总打分数少于输入
+        // (MiniCluster 中广播可能在主流之前就位，极端时 0 score 全 backlog —— 仍满足 < input)
+        assertTrue(ScoreSink.values.size() < data.size(),
+                "BACKLOG mode should produce fewer scores than input (some buffered), got "
+                        + ScoreSink.values.size() + "/" + data.size());
     }
+
 
     // ===== v3.1 场景 R1: 环形缓冲 Phase B =====
     // Scenario R1: ring buffer Phase B — 25 trees produced after buffer fills
@@ -998,12 +688,4 @@ public class LocalProcessorFunctionTest {
         }
     }
 
-    private static class DriftReportSink implements SinkFunction<DriftReport> {
-        static final List<DriftReport> values = Collections.synchronizedList(new ArrayList<>());
-
-        @Override
-        public void invoke(DriftReport value, Context context) {
-            values.add(value);
-        }
-    }
 }

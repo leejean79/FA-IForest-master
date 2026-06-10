@@ -1,11 +1,11 @@
 package com.leejean.flink;
 
 /**
- * v3.4 LOCAL_DRIFT_REPORTED 状态下的暂停模式
- * v3.4 pause mode during LOCAL_DRIFT_REPORTED state.
+ * COOLDOWN / WAITING 期的样本处理模式。
+ * Sample-handling mode while in COOLDOWN / WAITING (driven by COMMITTED).
  *
  * <ul>
- *   <li>{@link #USE_OLD_FOREST}：继续用旧森林打分输出，HDDM 暂停</li>
+ *   <li>{@link #USE_OLD_FOREST}：继续用旧森林打分输出</li>
  *   <li>{@link #BACKLOG_THEN_NEW_FOREST}：数据进 backlog，等新森林到来后再批量打分</li>
  * </ul>
  */

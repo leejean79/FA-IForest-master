@@ -2,8 +2,8 @@ package com.leejean.common_utils;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.leejean.beans.DriftReport;
 import com.leejean.beans.DriftRoundMessage;
+import com.leejean.beans.FeatureDrift;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -35,7 +35,7 @@ public class JacksonKafkaConsumer {
         try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
 
             // 3. 定义并精准订阅多个固定主题 (List 方式)
-            List<String> targetTopics = Arrays.asList("drift-round-topic","drift-topic");
+            List<String> targetTopics = Arrays.asList("drift-round-topic","feature-drift-topic");
             consumer.subscribe(targetTopics);
 
             System.out.println("✅ 消费者启动成功！正在监听以下主题: " + targetTopics);
@@ -63,11 +63,10 @@ public class JacksonKafkaConsumer {
                             }
                             break;
 
-                        case "drift-topic":
-                            // 处理树结构更新 (这里假设你暂未写实体类，直接打印字符串)
-                            DriftReport driftReport = mapper.readValue(rawJson, DriftReport.class);
-                            System.out.println(driftReport);
-                            // 你的构建树逻辑...
+                        case "feature-drift-topic":
+                            // 检测面每特征确认 onset 上报 / per-feature confirmed onset
+                            FeatureDrift featureDrift = mapper.readValue(rawJson, FeatureDrift.class);
+                            System.out.println(featureDrift);
                             break;
 
                         default:

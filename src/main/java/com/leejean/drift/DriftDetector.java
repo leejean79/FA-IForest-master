@@ -13,7 +13,7 @@ public interface DriftDetector extends Serializable {
     /** 重置内部状态（漂移确认后必调用）。*/
     void reset();
 
-    /** 累计已观察的样本数（调试和 DriftReport 用）。*/
+    /** 累计已观察的样本数（调试用）。*/
     long sampleCount();
 
     /** WARN 是否超时 / Whether WARN has timed out. */

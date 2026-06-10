@@ -13,7 +13,7 @@ public class KafkaMainCleaner {
             helper.cleanupConsumerGroups("kafka-consumer-");
             helper.cleanupConsumerGroups("model-consumer-");
             helper.cleanupConsumerGroups("drift-round-consumer-");
-            helper.cleanupConsumerGroups("drift-voter-");
+            helper.cleanupConsumerGroups("drift-aggregator-");
 
 
             System.out.println("\n========== 2. 开始重建业务主题 ==========");
@@ -23,7 +23,7 @@ public class KafkaMainCleaner {
             helper.recreateTopic("model-topic", 1, (short) 1);
             helper.recreateTopic("output-scores", 1, (short) 1);
             helper.recreateTopic("drift-round-topic", 1, (short) 1);
-            helper.recreateTopic("drift-topic", 1, (short) 1);
+            helper.recreateTopic("feature-drift-topic", 1, (short) 1);
 
             System.out.println("\n🎉 所有 Kafka 环境清理及重建完毕！");
 

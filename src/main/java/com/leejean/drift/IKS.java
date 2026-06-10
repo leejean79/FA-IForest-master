@@ -189,9 +189,10 @@ public class IKS implements DriftDetector {
 
     /**
      * IKS.KS 移植:D = max(treap.maxValue, −treap.minValue) / W。
-     * Package-private for white-box testing.
+     * 暴露为 public 供检测面 {@code PerFeatureIKSFunction} 读峰值-KS 用。
+     * Public for detection-side peak-KS gating (HANDOVER §3.1).
      */
-    double ks() {
+    public double ks() {
         if (nCurrent != nReference)
             throw new IllegalStateException("ks() requires nCurrent == nReference");
         long W = nCurrent;
@@ -200,9 +201,23 @@ public class IKS implements DriftDetector {
         return peak / (double) W;
     }
 
-    /** ca·√(2/W)。Package-private for tests. */
-    double threshold() {
+    /** ca·√(2/W)。Public for detection-side peak-KS gating. */
+    public double threshold() {
         return config.getCa() * Math.sqrt(2.0 / config.getWindowSize());
+    }
+
+    /**
+     * 检测面 rebase：确认 onset 后把 post-change 分布作为新基线。
+     * 当前实现 = {@code reset()} + 重新 warm-up，等价于「丢弃 reference/current
+     * 全部状态，用接下来的 W 条数据重建 reference」。
+     *
+     * <p>与 IKSSW.py.Update 的差异：原 Python 是把 current 直接固化为新 reference
+     * （零 blackout）；此实现引入 W 样本检测 blackout 期间一律返回 STABLE，但与
+     * 下游 COOLDOWN/WAITING 周期天然对齐——onset 确认后系统本就需要时间收
+     * post-change 训练池，blackout 不损 recall（onset 已确认上报）。
+     */
+    public void rebase() {
+        reset();
     }
 
     // ===================== composite key =====================

@@ -1,10 +1,10 @@
 package com.leejean.main;
 
 import com.leejean.flink.CoordinatorFunction;
-import com.leejean.flink.DriftVoterFunction;
+import com.leejean.flink.DriftAggregatorFunction;
 
-import com.leejean.beans.DriftReport;
 import com.leejean.beans.DriftRoundMessage;
+import com.leejean.beans.FeatureDrift;
 import com.leejean.beans.ForestMessage;
 import com.leejean.beans.ITreeMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -24,29 +24,20 @@ import java.util.Properties;
 import java.util.UUID;
 
 /**
- * v3.4 协调器作业入口：森林聚合 + 漂移投票
- * v3.4 Coordinator job entry: forest assembly + drift voting
+ * 协调器作业入口：森林聚合 + 检测面聚合器（方向二(a) Phase 3）。
+ * Coordinator job: forest assembly + cross-feature drift aggregation.
  *
- * <p>两条独立处理管线 / Two independent processing pipelines:
+ * <p>两条独立管线 / Two independent pipelines:
  * <ul>
- *   <li>tree-topic → CoordinatorFunction → model-topic（森林聚合）</li>
- *   <li>drift-topic → DriftVoterFunction → drift-round-topic（漂移投票）</li>
+ *   <li>tree-topic → CoordinatorFunction → model-topic（森林聚合，不动）</li>
+ *   <li>feature-drift-topic → DriftAggregatorFunction → drift-round-topic
+ *       （k 个不同特征确认 onset 落在 aggWin 内 → 合成 COMMITTED）</li>
  * </ul>
  *
  * 使用方式 / Usage:
  *   --broker localhost:9092 --treeTopic tree-topic --modelTopic model-topic
- *   --driftTopic drift-topic --driftRoundTopic drift-round-topic
- *   --parallelism 4 --totalTrees 100 --votingTimeoutMs 5000
- *
- * 参数说明 / Parameters:
- *   --broker            Kafka broker 地址，默认 localhost:9092
- *   --treeTopic         iTree 输入 topic，默认 tree-topic
- *   --modelTopic        全局森林输出 topic，默认 model-topic
- *   --driftTopic        漂移上报 topic（上行），默认 drift-topic
- *   --driftRoundTopic   漂移决议 topic（下行），默认 drift-round-topic
- *   --parallelism       LocalProcessor 的并行度（协调器自身始终 parallelism=1），默认 4
- *   --totalTrees        全局森林总树数，默认 100
- *   --votingTimeoutMs   投票超时毫秒数，默认 5000
+ *   --featureDriftTopic feature-drift-topic --driftRoundTopic drift-round-topic
+ *   --parallelism 4 --totalTrees 100 --aggK 2 --aggWin 2000 --refractory 5000
  */
 public class CoordinatorJob {
 
@@ -55,36 +46,41 @@ public class CoordinatorJob {
         String brokers = params.get("broker", "localhost:9092");
         String treeTopic = params.get("treeTopic", "tree-topic");
         String modelTopic = params.get("modelTopic", "model-topic");
-        String driftTopic = params.get("driftTopic", "drift-topic");
+        String featureDriftTopic = params.get("featureDriftTopic", "feature-drift-topic");
         String driftRoundTopic = params.get("driftRoundTopic", "drift-round-topic");
         int parallelism = params.getInt("parallelism", 4);
         int totalTrees = params.getInt("totalTrees", 100);
-        long votingTimeoutMs = params.getLong("votingTimeoutMs", 5000L);
+
+        // 聚合器参数 / aggregator parameters
+        int aggK = params.getInt("aggK", 2);
+        long aggWin = params.getLong("aggWin", 2000L);
+        long refractory = params.getLong("refractory", 5000L);
 
         int localTreeCount = (int) Math.ceil((double) totalTrees / parallelism);
         int expectedSlots = parallelism * localTreeCount;
 
         System.out.println("========================================");
-        System.out.println("Coordinator Job (v3.4)");
+        System.out.println("Coordinator Job (phase3)");
         System.out.println("Broker: " + brokers);
         System.out.println("Tree topic: " + treeTopic);
         System.out.println("Model topic: " + modelTopic);
-        System.out.println("Drift topic: " + driftTopic);
+        System.out.println("Feature drift topic: " + featureDriftTopic);
         System.out.println("Drift round topic: " + driftRoundTopic);
         System.out.println("LocalProcessor parallelism: " + parallelism);
         System.out.println("Total trees: " + totalTrees);
         System.out.println("Local tree count: " + localTreeCount);
         System.out.println("Expected slots: " + expectedSlots);
-        System.out.println("Voting timeout ms: " + votingTimeoutMs);
+        System.out.println("Aggregator k: " + aggK);
+        System.out.println("Aggregator window: " + aggWin);
+        System.out.println("Refractory: " + refractory);
         System.out.println("========================================");
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        // 协调器始终 parallelism=1 / coordinator always runs at parallelism=1
+        // 协调器始终 parallelism=1
         env.setParallelism(1);
-        env.enableCheckpointing(10000);  // 开启 checkpoint，使 AT_LEAST_ONCE Producer 在 checkpoint 时 flush+等 ack，确保单条森林可靠落盘
+        env.enableCheckpointing(10000);
 
-
-        // ===== Source: 订阅 tree-topic =====
+        // ===== Pipeline 1: tree-topic → CoordinatorFunction → model-topic =====
         Properties consumerProps = new Properties();
         consumerProps.setProperty("bootstrap.servers", brokers);
         consumerProps.setProperty("group.id",
@@ -92,7 +88,6 @@ public class CoordinatorJob {
 
         FlinkKafkaConsumer<String> treeConsumer = new FlinkKafkaConsumer<>(
                 treeTopic, new SimpleStringSchema(), consumerProps);
-        // 从 earliest 读：重启后能恢复完整树状态 / from-earliest: recover full tree state on restart
         treeConsumer.setStartFromEarliest();
 
         DataStream<ITreeMessage> treeStream = env.addSource(treeConsumer)
@@ -100,13 +95,11 @@ public class CoordinatorJob {
                 .map(new ITreeMessageDeserializer())
                 .name("Parse ITreeMessage");
 
-        // ===== Process: 协调聚合 =====
         DataStream<ForestMessage> forestStream = treeStream
                 .keyBy((KeySelector<ITreeMessage, String>) t -> "global")
                 .process(new CoordinatorFunction(parallelism, totalTrees))
                 .name("Coordinator Function");
 
-        // ===== Sink: 发到 model-topic =====
         Properties producerProps = new Properties();
         producerProps.setProperty("bootstrap.servers", brokers);
         producerProps.setProperty("max.request.size", "5242880");
@@ -123,25 +116,25 @@ public class CoordinatorJob {
 
         forestStream.print("ForestMessage emitted");
 
-        // ===== Pipeline 2: 漂移投票 drift-topic → DriftVoterFunction → drift-round-topic =====
-        Properties driftConsumerProps = new Properties();
-        driftConsumerProps.setProperty("bootstrap.servers", brokers);
-        driftConsumerProps.setProperty("group.id",
-                "drift-voter-" + UUID.randomUUID().toString().substring(0, 8));
+        // ===== Pipeline 2: feature-drift-topic → DriftAggregatorFunction → drift-round-topic =====
+        Properties aggConsumerProps = new Properties();
+        aggConsumerProps.setProperty("bootstrap.servers", brokers);
+        aggConsumerProps.setProperty("group.id",
+                "drift-aggregator-" + UUID.randomUUID().toString().substring(0, 8));
 
-        FlinkKafkaConsumer<String> driftConsumer = new FlinkKafkaConsumer<>(
-                driftTopic, new SimpleStringSchema(), driftConsumerProps);
-        driftConsumer.setStartFromEarliest();
+        FlinkKafkaConsumer<String> fdConsumer = new FlinkKafkaConsumer<>(
+                featureDriftTopic, new SimpleStringSchema(), aggConsumerProps);
+        fdConsumer.setStartFromEarliest();
 
-        DataStream<DriftReport> driftStream = env.addSource(driftConsumer)
-                .name("Drift Topic Source [" + driftTopic + "]")
-                .map(new DriftReportDeserializer())
-                .name("Parse DriftReport");
+        DataStream<FeatureDrift> fdStream = env.addSource(fdConsumer)
+                .name("Feature Drift Topic Source [" + featureDriftTopic + "]")
+                .map(new FeatureDriftDeserializer())
+                .name("Parse FeatureDrift");
 
-        DataStream<DriftRoundMessage> roundStream = driftStream
-                .keyBy((KeySelector<DriftReport, String>) r -> "global")
-                .process(new DriftVoterFunction(parallelism, votingTimeoutMs))
-                .name("Drift Voter Function");
+        DataStream<DriftRoundMessage> roundStream = fdStream
+                .keyBy((KeySelector<FeatureDrift, String>) f -> "global")
+                .process(new DriftAggregatorFunction(aggK, aggWin, refractory))
+                .name("Drift Aggregator Function");
 
         FlinkKafkaProducer<DriftRoundMessage> roundProducer = new FlinkKafkaProducer<>(
                 driftRoundTopic,
@@ -154,31 +147,22 @@ public class CoordinatorJob {
 
         roundStream.print("DriftRoundMessage emitted");
 
-        env.execute("Coordinator - Forest Assembly + Drift Voting (v3.4)");
+        env.execute("Coordinator - Forest Assembly + Cross-Feature Aggregation (phase3)");
     }
 
     // ===== 序列化/反序列化 =====
 
-    /**
-     * ITreeMessage JSON 反序列化器 / ITreeMessage JSON deserializer
-     */
     private static class ITreeMessageDeserializer implements MapFunction<String, ITreeMessage> {
         private static final long serialVersionUID = 1L;
         private transient ObjectMapper mapper;
 
         @Override
         public ITreeMessage map(String json) throws Exception {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
+            if (mapper == null) mapper = new ObjectMapper();
             return mapper.readValue(json, ITreeMessage.class);
         }
     }
 
-    /**
-     * ForestMessage → Kafka ProducerRecord 的序列化器
-     * Serializer: ForestMessage → Kafka ProducerRecord (JSON)
-     */
     private static class ForestMessageSerializationSchema
             implements KafkaSerializationSchema<ForestMessage> {
 
@@ -186,15 +170,11 @@ public class CoordinatorJob {
         private final String topic;
         private transient ObjectMapper mapper;
 
-        ForestMessageSerializationSchema(String topic) {
-            this.topic = topic;
-        }
+        ForestMessageSerializationSchema(String topic) { this.topic = topic; }
 
         @Override
         public ProducerRecord<byte[], byte[]> serialize(ForestMessage msg, @Nullable Long timestamp) {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
+            if (mapper == null) mapper = new ObjectMapper();
             try {
                 byte[] value = mapper.writeValueAsBytes(msg);
                 return new ProducerRecord<>(topic, null, value);
@@ -204,26 +184,17 @@ public class CoordinatorJob {
         }
     }
 
-    /**
-     * DriftReport JSON 反序列化器 / DriftReport JSON deserializer
-     */
-    private static class DriftReportDeserializer implements MapFunction<String, DriftReport> {
+    private static class FeatureDriftDeserializer implements MapFunction<String, FeatureDrift> {
         private static final long serialVersionUID = 1L;
         private transient ObjectMapper mapper;
 
         @Override
-        public DriftReport map(String json) throws Exception {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
-            return mapper.readValue(json, DriftReport.class);
+        public FeatureDrift map(String json) throws Exception {
+            if (mapper == null) mapper = new ObjectMapper();
+            return mapper.readValue(json, FeatureDrift.class);
         }
     }
 
-    /**
-     * DriftRoundMessage → Kafka ProducerRecord 的序列化器
-     * Serializer: DriftRoundMessage → Kafka ProducerRecord (JSON)
-     */
     private static class DriftRoundMessageSerializationSchema
             implements KafkaSerializationSchema<DriftRoundMessage> {
 
@@ -231,15 +202,11 @@ public class CoordinatorJob {
         private final String topic;
         private transient ObjectMapper mapper;
 
-        DriftRoundMessageSerializationSchema(String topic) {
-            this.topic = topic;
-        }
+        DriftRoundMessageSerializationSchema(String topic) { this.topic = topic; }
 
         @Override
         public ProducerRecord<byte[], byte[]> serialize(DriftRoundMessage msg, @Nullable Long timestamp) {
-            if (mapper == null) {
-                mapper = new ObjectMapper();
-            }
+            if (mapper == null) mapper = new ObjectMapper();
             try {
                 byte[] value = mapper.writeValueAsBytes(msg);
                 return new ProducerRecord<>(topic, null, value);
