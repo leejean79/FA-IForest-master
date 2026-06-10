@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Phase 1 de-risk harness — direction 2(a).
-Reference: HANDOVER_direction2a_phase1_derisk.md
+Reference: HANDOVER_direction2a_phase1_derisk{,_2}.md
 
 Scientific question:
     Does per-feature marginal drift (IKS on single-feature value streams)
@@ -18,28 +18,39 @@ Outputs (analysis/out/):
     derisk_ksweep.csv      dataset, k, latency, FP, FN
     derisk_<dataset>.png   AUC(t) curve + GT-A onset + per-feature fire rug + driftspec markers
 
+CLI:
+    python3 analysis/derisk_proxy.py                            # run all datasets in datasets.yml
+    python3 analysis/derisk_proxy.py --dataset <name>           # run just one (e.g. for INSECTS on leejean's box)
+    python3 analysis/derisk_proxy.py --list                     # list datasets the yml exposes
+
+Data-agnostic loader (HANDOVER §10):
+- Honors deploy/datasets.yml fields hasHeader / hasId / hasLabel / labelPosition
+  / anomalyLabel / dimensions exactly; no hardcoded column names or dim counts.
+- Auto-sniffs delimiter (',' or tab).
+- Sanity-checks the parsed feature count against the yml's `dimensions`.
+
 Notes:
 - KS inside the harness is value-based two-sample (np.searchsorted), which the
   deployed composite-key IKSSW (Java) upper-bounds by <= 1/W. For W=2000 that
   bias is ~5e-4, well under the fire threshold ca*sqrt(2/W) ~ 5.9e-2 at p=0.001,
   so fire decisions are equivalent. The faithful port lives in analysis/ikssw.py
   for byte-level equivalence checks on smaller slices.
-- INSECTS datasets are auto-skipped if their CSV is missing; the summary records
-  the skip so the Phase-1 verdict against real data can be reproduced when the
-  data is provided.
+- Datasets whose CSV is missing are auto-skipped (summary row records the skip).
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import math
 import os
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
+import yaml
 
 # matplotlib without an X display
 import matplotlib
@@ -84,91 +95,133 @@ AGG_WIN = W          # how far back agg onset looks for rising edges
 TAU = GT_WIN         # FN tolerance window (samples)
 
 
-# ---------------- dataset registry ----------------
+# ---------------- dataset registry (datasets.yml driven) ----------------
+
+# datasets where GT-A signal is weak (low absolute ceiling). Per HANDOVER §7, use
+# a relative-drop delta for those. The default GT_DELTA is for synth ~1.0 baselines.
+WEAK_GT_A_DATASETS = {"insects_abrupt_imbalanced", "insects_gradual_imbalanced"}
+
 
 @dataclass
 class DatasetSpec:
+    """Carries everything the harness needs about one dataset, sourced from datasets.yml."""
     name: str
     csv_path: Path
-    drift_starts: List[int]   # for GT-A: drift_starts[0] = pre_end; later events used by overlay only
-    label_col: Optional[str] = "label"   # column NAME if hasHeader; else None and use last
-    drop_id: bool = True
-    delta: float = GT_DELTA
+    has_header: bool
+    has_id: bool
+    has_label: bool
+    label_position: Any           # "last" | "first" | int (0-based)
+    anomaly_label: str            # string per yml convention (e.g. "1")
+    dimensions: int
+    drift_starts: List[int] = field(default_factory=list)
+    delta: float = GT_DELTA       # AUC degradation tolerance below baseline
 
 
-def _load_synth_drift_starts(name: str) -> List[int]:
-    spec_path = DATA_DIR / "synth" / f"{name}.driftspec.json"
-    with open(spec_path) as f:
-        spec = json.load(f)
-    return [int(e["start_line"]) for e in spec.get("drift_events", [])]
-
-
-def _load_insects_drift_events_from_yml(name: str) -> List[int]:
-    """
-    Parse `drift_events: [a, b, ...]` line from datasets.yml without pulling in
-    a YAML dep — datasets.yml writes drift_events on a single line as a flow seq.
-    """
-    if not DATASETS_YML.exists():
-        return []
-    in_section = False
+def _load_yml() -> Dict[str, Any]:
     with open(DATASETS_YML) as f:
-        for raw in f:
-            line = raw.rstrip()
-            stripped = line.strip()
-            # naive but sufficient: enter the named block, scan its body lines
-            if stripped == f"{name}:":
-                in_section = True
-                continue
-            if in_section:
-                if stripped == "" or (line and not line.startswith(" ") and not line.startswith("\t")):
-                    in_section = False
-                    continue
-                if stripped.startswith("drift_events:"):
-                    rhs = stripped.split(":", 1)[1].strip()
-                    # expect: [a, b, c]   (possibly with trailing comment)
-                    if "#" in rhs:
-                        rhs = rhs.split("#", 1)[0].strip()
-                    rhs = rhs.strip("[]")
-                    return [int(x.strip()) for x in rhs.split(",") if x.strip()]
+        return yaml.safe_load(f) or {}
+
+
+def _resolve_drift_starts(name: str, meta: Dict[str, Any]) -> List[int]:
+    """drift_starts source priority: meta['drift_events'] (yml inline) -> drift_spec JSON."""
+    if "drift_events" in meta:
+        return [int(x) for x in meta["drift_events"]]
+    spec_rel = meta.get("drift_spec")
+    if spec_rel:
+        spec_path = PROJECT_ROOT / spec_rel
+        if spec_path.exists():
+            with open(spec_path) as f:
+                spec = json.load(f) or {}
+            return [int(e["start_line"]) for e in spec.get("drift_events", [])]
     return []
 
 
 def all_dataset_specs() -> List[DatasetSpec]:
+    yml = _load_yml()
+    datasets = yml.get("datasets", {}) or {}
     specs: List[DatasetSpec] = []
-    for name in ("synth_abrupt", "synth_gradual", "synth_incremental", "synth_reoccurring"):
-        csv_path = DATA_DIR / "synth" / f"{name}.csv"
-        starts = _load_synth_drift_starts(name)
-        specs.append(DatasetSpec(name=name, csv_path=csv_path, drift_starts=starts))
-    # INSECTS — wider delta because GT-A signal is weaker (ceiling ~0.75, see HANDOVER §7)
-    insects_name = "insects_abrupt_imbalanced"
-    insects_csv = DATA_DIR / "insects" / "INSECTS_abrupt_imbalanced_transformed.csv"
-    insects_starts = _load_insects_drift_events_from_yml(insects_name)
-    specs.append(DatasetSpec(name=insects_name, csv_path=insects_csv,
-                             drift_starts=insects_starts, delta=0.10))
+    for name, meta in datasets.items():
+        # only consider entries we actually want to evaluate; the harness skips
+        # gracefully on missing CSVs, so list everything driver provides.
+        csv_path = PROJECT_ROOT / meta["path"]
+        delta = 0.10 if name in WEAK_GT_A_DATASETS else GT_DELTA
+        specs.append(DatasetSpec(
+            name=name,
+            csv_path=csv_path,
+            has_header=bool(meta.get("hasHeader", True)),
+            has_id=bool(meta.get("hasId", False)),
+            has_label=bool(meta.get("hasLabel", True)),
+            label_position=meta.get("labelPosition", "last"),
+            anomaly_label=str(meta.get("anomalyLabel", "1")),
+            dimensions=int(meta.get("dimensions", 0)),
+            drift_starts=_resolve_drift_starts(name, meta),
+            delta=delta,
+        ))
     return specs
 
 
-# ---------------- CSV loader ----------------
+# ---------------- CSV loader (data-agnostic, HANDOVER §10) ----------------
 
-def load_csv(csv_path: Path, label_col: str = "label",
-             drop_id: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns X (n, D) float and y (n,) int. Mirrors the oracle_ceiling_test.py
-    column logic (skip id, label by name, the rest are features).
-    """
-    rows: List[List[str]] = []
-    header: List[str] = []
+def _sniff_delimiter(csv_path: Path) -> str:
     with open(csv_path) as f:
-        r = csv.reader(f)
-        header = next(r)
+        sample = f.read(8192)
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        return dialect.delimiter
+    except csv.Error:
+        # fall back: pick whichever common delim shows up most in first line
+        first = sample.splitlines()[0] if sample else ""
+        return "\t" if first.count("\t") > first.count(",") else ","
+
+
+def _resolve_label_index(label_position: Any, n_cols: int) -> int:
+    if isinstance(label_position, int):
+        return int(label_position)
+    if isinstance(label_position, str):
+        lp = label_position.strip().lower()
+        if lp == "last":
+            return n_cols - 1
+        if lp == "first":
+            return 0
+        if lp.lstrip("-").isdigit():
+            return int(lp)
+    raise ValueError(f"unrecognized labelPosition: {label_position!r}")
+
+
+def load_dataset(spec: DatasetSpec) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns X (n, D) float and y (n,) int from `spec.csv_path`. Pure yml-driven:
+    no column-name lookup, label by position, anomalyLabel string comparison.
+    """
+    delim = _sniff_delimiter(spec.csv_path)
+    rows: List[List[str]] = []
+    n_cols: Optional[int] = None
+    with open(spec.csv_path) as f:
+        r = csv.reader(f, delimiter=delim)
+        if spec.has_header:
+            header = next(r)
+            n_cols = len(header)
         for line in r:
+            if not line:
+                continue
+            if n_cols is None:
+                n_cols = len(line)
             rows.append(line)
-    li = header.index(label_col)
-    # skip id (first column) and label
-    feat_idx = [i for i in range(len(header))
-                if i != li and not (drop_id and i == 0 and header[i].lower() in ("id", "seq"))]
+    if n_cols is None:
+        raise RuntimeError(f"{spec.csv_path}: empty CSV")
+    li = _resolve_label_index(spec.label_position, n_cols) if spec.has_label else -1
+    id_col = 0 if spec.has_id else -1
+    feat_idx = [i for i in range(n_cols) if i != li and i != id_col]
+    if spec.dimensions and len(feat_idx) != spec.dimensions:
+        raise RuntimeError(
+            f"{spec.name}: parsed {len(feat_idx)} feature cols, yml says dimensions={spec.dimensions}; "
+            f"check hasHeader / hasId / labelPosition")
     X = np.array([[float(row[i]) for i in feat_idx] for row in rows], dtype=float)
-    y = np.array([int(float(row[li])) for row in rows], dtype=int)
+    if spec.has_label:
+        anom = spec.anomaly_label
+        y = np.array([1 if row[li].strip() == anom else 0 for row in rows], dtype=int)
+    else:
+        y = np.zeros(len(rows), dtype=int)
     return X, y
 
 
@@ -538,9 +591,9 @@ def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Tuple[Dict[str, str], L
 
     print(f"=== {spec.name} ===")
     print(f"  load {spec.csv_path}")
-    X, y = load_csv(spec.csv_path)
+    X, y = load_dataset(spec)
     n, D = X.shape
-    print(f"  n={n}, D={D}, anomaly_rate={y.mean():.4f}, drift_starts={spec.drift_starts}")
+    print(f"  n={n}, D={D}, anomaly_rate={y.mean():.4f}, drift_starts={spec.drift_starts}, delta={spec.delta}")
     if not spec.drift_starts:
         return ({
             "dataset": spec.name, "GT_A_onset": "NA", "best_k": "NA",
@@ -608,17 +661,53 @@ def run_dataset(spec: DatasetSpec, k_grid: List[int]) -> Tuple[Dict[str, str], L
 
 
 def main():
+    ap = argparse.ArgumentParser(description="Phase 1 de-risk harness")
+    ap.add_argument("--dataset", default=None,
+                    help="run a single dataset by yml name (e.g. insects_abrupt_imbalanced); "
+                         "default = run every dataset in deploy/datasets.yml")
+    ap.add_argument("--list", action="store_true",
+                    help="list datasets the yml exposes and exit")
+    ap.add_argument("--k-grid", default="1,2,3",
+                    help="comma-separated initial k values to scan; 1 and D are always added")
+    args = ap.parse_args()
+
+    all_specs = all_dataset_specs()
+    if args.list:
+        for s in all_specs:
+            present = "ok" if s.csv_path.exists() else "missing"
+            print(f"  {s.name:36s}  D={s.dimensions:<3d}  drift_starts={s.drift_starts}  "
+                  f"csv={s.csv_path.relative_to(PROJECT_ROOT)} [{present}]")
+        return
+
+    if args.dataset:
+        specs = [s for s in all_specs if s.name == args.dataset]
+        if not specs:
+            raise SystemExit(f"unknown --dataset {args.dataset!r}; try --list")
+    else:
+        specs = all_specs
+
+    k_grid_base = [int(x) for x in args.k_grid.split(",") if x.strip()]
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # k grid spans 1, mid, ceil(D/2), D ; per-dataset will fold in 1 and D
-    k_grid_base = [1, 2, 3]
     summary_rows: List[Dict[str, str]] = []
     ksweep_rows: List[Dict[str, str]] = []
-    for spec in all_dataset_specs():
+    for spec in specs:
         srow, krows = run_dataset(spec, list(k_grid_base))
         summary_rows.append(srow)
         ksweep_rows.extend(krows)
 
+    # When --dataset is used, merge into existing summary/ksweep so a subsequent
+    # INSECTS run on leejean's box augments the synth run sitting in the repo.
     summary_path = OUT_DIR / "derisk_summary.csv"
+    ksweep_path = OUT_DIR / "derisk_ksweep.csv"
+    if args.dataset:
+        existing_summary = _read_existing_rows(summary_path)
+        existing_ksweep = _read_existing_rows(ksweep_path)
+        existing_summary = [r for r in existing_summary if r.get("dataset") != args.dataset]
+        existing_ksweep = [r for r in existing_ksweep if r.get("dataset") != args.dataset]
+        summary_rows = existing_summary + summary_rows
+        ksweep_rows = existing_ksweep + ksweep_rows
+
     with open(summary_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
             "dataset", "GT_A_onset", "best_k", "agg_onset",
@@ -629,7 +718,6 @@ def main():
             w.writerow(row)
     print(f"\n  -> {summary_path.relative_to(PROJECT_ROOT)}")
 
-    ksweep_path = OUT_DIR / "derisk_ksweep.csv"
     with open(ksweep_path, "w", newline="") as f:
         if ksweep_rows:
             w = csv.DictWriter(f, fieldnames=list(ksweep_rows[0].keys()))
@@ -637,6 +725,13 @@ def main():
             for row in ksweep_rows:
                 w.writerow(row)
     print(f"  -> {ksweep_path.relative_to(PROJECT_ROOT)}")
+
+
+def _read_existing_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with open(path) as f:
+        return list(csv.DictReader(f))
 
 
 if __name__ == "__main__":
