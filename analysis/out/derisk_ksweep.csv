@@ -1,0 +1,17 @@
+dataset,k,latency,FP,FN,n_agg_onsets
+synth_abrupt,1,-375,0,0,1
+synth_abrupt,2,-375,0,0,1
+synth_abrupt,3,-375,0,0,1
+synth_abrupt,5,-375,0,0,1
+synth_gradual,1,,1,1,1
+synth_gradual,2,875,0,0,1
+synth_gradual,3,875,0,0,1
+synth_gradual,5,1125,0,0,1
+synth_incremental,1,-14500,0,1,1
+synth_incremental,2,-14500,0,1,1
+synth_incremental,3,-14125,0,0,2
+synth_incremental,5,-14000,0,1,1
+synth_reoccurring,1,-375,0,1,1
+synth_reoccurring,2,-375,0,0,3
+synth_reoccurring,3,-375,0,0,3
+synth_reoccurring,5,-375,0,0,3

@@ -1,0 +1,6 @@
+dataset,GT_A_onset,best_k,agg_onset,latency,FP,FN,features_fired,verdict
+synth_abrupt,50500,1,50125,-375,0,0,0|1|2|3|4,proxy_holds
+synth_gradual,41500,2,42375,875,0,0,0|1|2|3|4,proxy_holds
+synth_incremental,36000,3,21875,-14125,0,0,0|1|2|3|4,proxy_holds
+synth_reoccurring,30500,2,30125,-375,0,0,0|1|2|3|4,proxy_holds
+insects_abrupt_imbalanced,NA,NA,NA,NA,NA,NA,NA,skipped:no_csv(data/insects/INSECTS_abrupt_imbalanced_transformed.csv)

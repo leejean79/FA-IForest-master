@@ -11,8 +11,8 @@
 
 v2 改动:
   1. gradual 改为概率混合(p(t) 随时间从 0 到 1, 决定每条点属于 C1 或 C2)
-  2. 漂移幅度: normal 类 mu 0 → 4 (与 ANOMALY_MU 重合, AUC 漂移前 ~1.0 漂移后 ~0.65)
-  3. 异常类 ANOMALY_MU=4, SIGMA=1.5 (与漂移后 normal 类重合, 漂移影响明显)
+  2. 漂移幅度: normal 类 mu 0 → 8, 与 anomaly_mu=4 分离; 漂移后可分性由 Gate 0 实测确认 (修复后 abrupt 天花板 = 1.00)
+  3. 异常类 ANOMALY_MU=4, SIGMA=1.5 (静止, 不动)
   4. n=100000 (与 INSECTS 数据量级对齐)
   5. reoccurring 修正切换位置, 与 n=100000 匹配
 
@@ -38,10 +38,10 @@ DEFAULT_DIM = 5             # 特征维度
 ANOMALY_RATIO = 0.05        # 异常占比
 SEED = 42                   # 可重复性
 
-# v2: 漂移后 normal 类 mu 从 0 → 4 (与 ANOMALY_MU 重合)
-# 经实证, mu_after=4 让漂移后 AUC 从 ~1.0 降到 ~0.65, 漂移影响明显但不"病态翻转"
+# 漂移后 normal 类 mu 从 0 → 8, 与 anomaly_mu=4 分离
+# 漂移后可分性由 Gate 0 实测确认 (修复后 abrupt 天花板 = 1.00)
 NORMAL_MU_BEFORE = 0.0
-NORMAL_MU_AFTER = 4.0
+NORMAL_MU_AFTER = 8.0
 NORMAL_SIGMA = 1.0
 
 # v2: 异常类 mu 从 8 → 4, sigma 从 2 → 1.5
