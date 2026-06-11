@@ -10,12 +10,14 @@
 > 已废: `exp1_hddm_w` (HDDM_W 算法对比)、`sensitivity_hddm_conf` (warnConfidence/driftConfidence 成对扫)、C1–C4 中的 `warnTimeoutBehavior` 维度 (无 WARN 状态了)。
 > 详见 `HANDOVER_direction2a_phase3_arch.md`。
 
-| 实验 | 目的 | 网格 | 数据集 |
-|---|---|---|---|
-| **EXP1 (核心)** | 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率 | 见下 + Phase3 附录 B | synth_abrupt + INSECTS_abrupt (+1~2 drift 型) |
-| EXP2 | stationary 误触发率 (per-feature 在无漂移流上应几乎不 fire = 精度基线) | 5 × 30 shuffle | 5 个 stationary |
-| EXP3 | 扩展性 + Fork 2 (source partition=P) | P∈{1,2,4,6} | donors / http |
-| EXP4 (可选) | per-feature IKS vs per-feature HDDM | — | — |
+| 实验 | plan 名 | 规模 | 数据集 | 目的 |
+|---|---|---|---|---|
+| **EXP1 (核心)** | `exp1` | 54 (3×2×3×3) | synth_abrupt + 2 INSECTS | 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率 |
+| EXP2 | `exp2` | 150 (5×30) | 5 stationary | per-feature 在无漂移流上误触发率 = 精度基线 |
+| EXP3 | `exp3` | 24 (2×4×3) | donors / http | 扩展性 (P∈{1,2,4,6});Fork 2 需手动调 `.env: SOURCE_PARTITIONS` |
+| EXP4 (可选) | `exp4` | enabled: false | — | per-feature IKS vs per-feature HDDM (待 PerFeatureHDDM 落地) |
+| 敏感性 | `sensitivity` | 51 | synth_abrupt | OAT 扫 `iksWindowSize / aggK / ksConfirm / ringBufferSize / cooldownSamples` |
+| 冒烟 | `smoke_batch` | 2 | synth_abrupt | 验证批量调度 + topic 清理 + 断点续跑 |
 
 **EXP1 最小网格** (不跑全组合): `{新 per-feature vs 旧 score 行并行} × P∈{1,2,4} × 数据集 × 3~5 seed`。
 - 「**新**」臂 = Phase 3 检测面 build;「**旧**」臂 = 删检测前的 score 域 build (如 `feature/hddm-w` 或 Phase 3 前的 tag)。**两臂不同 build** —— Phase 3 已移除 score 检测, 同一 build 跑不了旧法。
@@ -151,8 +153,13 @@ bash deploy/scripts/run-experiment.sh \
     --dataset synth_abrupt --config-id USE_OLD_FOREST --run-id 1 \
     --extra-param "iksWindowSize=2000;iksPValue=0.001;aggK=2"
 ```
-启动 banner 应打出 `IKS window: 2000 / IKS pValue: 0.001 / aggK: 2` (不是默认值);
-EXP_ID 形如 `synth_abrupt_USE_OLD_FOREST_iks_p4_r1_iksWindowSize-2000_..._aggK-2`。
+启动 banner 应打出:
+- **LocalProcessor**: `IKS window size W: 2000` / `IKS pValue: 0.001` / `Confirm window C: ...` / `ksConfirm: ...`
+- **CoordinatorJob**: `Aggregator k: 2` / `Aggregator window: ...` / `Refractory: ...`
+
+(extra-param 同时透传两个 job;Flink ParameterTool 对未知 key 静默忽略,所以 `aggK` 落在 CoordinatorJob、`iks*` 落在 LocalProcessor。)
+EXP_ID 形如 `synth_abrupt_USE_OLD_FOREST_default_p4_r1_iksWindowSize-2000_iksPValue-0.001_aggK-2`
+(`default` 是 algo_tag,主路径不传 `--algorithm` 时的默认值)。
 
 ---
 
@@ -279,18 +286,33 @@ mode: `drift` (实验1/4) / `stationary` (实验2) / `scalability` (实验3) / `
 └── runtime.log               # JobManager 日志末尾 100 行
 ```
 
-**exp_id 命名**: `{dataset}_{config}_{algo}_p{N}_r{run}`
-例: `synth_abrupt_C1_default_p4_r1`
+**exp_id 命名**: `{dataset}_{config}_{algo}_p{N}_r{run}[_extra...]`
+例: `synth_abrupt_USE_OLD_FOREST_default_p4_r1_iksWindowSize-2000_aggK-2`
+(`config` 现取 pauseMode 字面值 `USE_OLD_FOREST` / `BACKLOG_THEN_NEW_FOREST`,而非旧 C1–C4。)
 
 ---
 
 ## 7. 推荐执行顺序 (方向二(a))
 
+实际规模(经 `experiment-configs.yml` 展开):
+- `smoke_batch` = 2 (synth_abrupt × 2 pauseMode)
+- `exp1` = 54 (3 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats),自带 plan_extras: `iksWindowSize=2000;iksPValue=0.001;aggK=2`
+- `exp2` = 150 (5 stationary × 30 shuffle)
+- `exp3` = 24 (2 datasets × P∈{1,2,4,6} × 3 repeats)
+- `sensitivity` = 51 (OAT 扫 iksWindowSize / aggK / ksConfirm / ringBufferSize / cooldownSamples)
+
+EXP3 升 Fork 2 要先把 `.env` 的 `SOURCE_PARTITIONS` 改成对应 `P_d`,然后重建 source-topic(`bash deploy/scripts/clean-topics.sh`)。
+
 ```bash
 ssh fa-master
 cd /opt/fa-iforest/repo
 
-# (1) EXP1 新臂 across P — 核心: 恢复曲线 + 重训频率 + P-不变
+# (0) 冒烟 — 先跑 smoke_batch 验机制(2 个实验,~几分钟)
+tmux new -s smoke
+RUN_MODE=local bash deploy/scripts/run-batch.sh --plan smoke_batch 2>&1 | tee smoke.out
+# Ctrl+B D 脱离
+
+# (1) EXP1 新臂 across P — 核心: 恢复曲线 + 重训频率 + P-不变 (54 实验)
 tmux new -s exp1_new
 RUN_MODE=local bash deploy/scripts/run-batch.sh --plan exp1 2>&1 | tee exp1_new.out
 # Ctrl+B D 脱离;exit 退 ssh, 实验自治继续
@@ -326,12 +348,15 @@ scp deploy/experiment-configs.yml fa-master:/opt/fa-iforest/repo/deploy/
 # 步骤 2: dry-run 核对展开行数 + 每行 extra 列
 ssh fa-master "cd /opt/fa-iforest/repo && bash deploy/scripts/run-batch.sh --plan <plan> --dry-run | head -20"
 
-# 步骤 3: 单跑 1 次, 核对参数透传到检测面 banner (关键防呆)
+# 步骤 3: 单跑 1 次, 核对参数透传到检测面 banner (关键防呆 —— 两个 job 都要看!)
 ssh fa-master "cd /opt/fa-iforest/repo && RUN_MODE=local bash deploy/scripts/run-experiment.sh \
     --dataset <ds> --config-id <cfg> --run-id 1 \
     --extra-param 'iksWindowSize=2000;iksPValue=0.001;aggK=2'"
-# banner 必须打 IKS window: 2000 / IKS pValue: 0.001 / aggK: 2, 不能是默认
-#   (旧的 warnConfidence/driftConfidence 已废, 别再核对那两个)
+# LocalProcessor banner 必须打: IKS window size W: 2000 / IKS pValue: 0.001
+# CoordinatorJob banner 必须打: Aggregator k: 2
+# 都不能是默认值。两个 banner 在不同 JobManager 日志段, 分别核对:
+#   docker logs jobmanager 2>&1 | grep -E 'IKS window|IKS pValue|Aggregator k'
+# (旧的 warnConfidence/driftConfidence 已废, 别再核对那两个)
 ```
 
 ---
@@ -346,6 +371,27 @@ A: 结果目录权限。脚本已 `chmod 777 $RESULT_DIR`, 若仍失败查容器
 
 **Q: `[7/9] scores.jsonl 为空`?**
 A: Dumper 没消费到数据或写盘失败。脚本会打 dumper 日志, 看是连不上 kafka 还是写权限。
+
+**Q: 检测面 `feature-drift-topic` 一直空,没收到任何 FeatureDrift?**
+A: per-feature IKS 需要先暖机 W 条 (默认 W=2000),W 条之前一律返回 STABLE。先确认数据量 ≥ W;
+   再确认数据真有分布漂移 —— stationary 数据集 (EXP2) 本就预期不该 fire,这是「精度基线」目的。
+   有漂移的数据集 (synth_abrupt、INSECTS_*) 若 W 条之后仍无 emit:
+   `docker logs jobmanager 2>&1 | grep "featureId" | head` 看 PerFeatureIKSFunction 的 DEBUG/INFO,
+   确认有没有进 confirm 态 / 是 ksConfirm 太严否决了 onset。默认 `ksConfirm = thr` 保守不该误杀。
+
+**Q: `feature-drift-topic` 有 FeatureDrift,但 `drift-round-topic` 没 COMMITTED?**
+A: 聚合器要求 ≥ `aggK` 个**不同 featureId** 落在 `aggWin` 窗内 (默认 k=2, aggWin=W=2000)。
+   若漂移只影响 1 个特征,k=2 永远不触发 —— 可临时调 `aggK=1` 验证;或核对 FeatureDrift 的
+   featureId 分布:`cat results-local/<exp>/feature-drift-topic.jsonl | jq -r .featureId | sort | uniq -c`。
+   `aggWin` 太小也会导致不同特征的 onset 没赶到一起 —— 看 onset seq 间距。
+
+**Q: 收到 COMMITTED 但 `model-topic` 没出新森林版本?**
+A: COMMITTED 触发 COOLDOWN 收池 (z-score 过滤),需要 ≥ `cooldownSamples`(默认 2000)且
+   ringBuffer (默认 1000) 被新数据覆盖才会重训。先看 LocalProcessor 日志的
+   `COOLDOWN-POOL-DIAG`:`rbSize / cWrites / cN / poolAnomaly`。常见情形:
+   - `cN` 卡 < `cooldownSamples` → 数据已灌完,COOLDOWN 没收够样本(降 `cooldownSamples` 或加大数据量)
+   - `cWrites` 远 < `rbSize` → z-score 卡得太严过滤掉太多(`zThresholdK` 调大,默认 1.0)
+   - 兜底 `cN >= cooldownSamples * 2` 触发后仍重训,但池可能很稀,质量打折(看 v1-v2 对比)。
 
 **Q: analyze.py 报 `missing required field 'seq'`?**
 A: scores.jsonl 字段名问题。ScoreResult 序列化用 originalSequence/dataPointId, 脚本 Step 7 会自动 rename 成 seq/id。若手动跑老结果, 先用脚本里那段 python 转换。
