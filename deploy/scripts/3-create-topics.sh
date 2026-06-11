@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
 # 3-create-topics.sh
-# 创建 6 个 Kafka topics, 名字与代码默认对齐:
-#   source-topic        partition=1   FileToKafkaProducer -> LocalProcessor
-#   tree-topic          partition=1   LocalProcessor.sideOutput -> CoordinatorJob
-#   model-topic         partition=1   CoordinatorJob -> LocalProcessor.broadcast
-#   output-scores       partition=1   LocalProcessor.sink (异常分数落盘)
-#   drift-topic         partition=1   LocalProcessor.sideOutput -> Coordinator
-#   drift-round-topic   partition=1   Coordinator -> LocalProcessor.broadcast (投票决议)
+# 创建 6 个 Kafka topics, 名字与代码默认对齐 (方向二(a) Phase 3):
+#   source-topic         partition=SOURCE_PARTITIONS  FileToKafkaProducer -> LocalProcessor
+#                                                      (Fork 1 v1=1 保 per-feature 顺序;Fork 2/EXP3 升 P_d)
+#   tree-topic           partition=1   LocalProcessor.sideOutput -> CoordinatorJob
+#   model-topic          partition=1   CoordinatorJob -> LocalProcessor.broadcast
+#   output-scores        partition=1   LocalProcessor.sink (异常分数落盘)
+#   feature-drift-topic  partition=1   LocalProcessor 检测面 -> CoordinatorJob 聚合器
+#   drift-round-topic    partition=1   Coordinator -> LocalProcessor.broadcast (COMMITTED)
 #
 # 用法 / Usage:
 #   bash 3-create-topics.sh            # 创建(已存在则跳过)
@@ -37,9 +38,20 @@ TOPICS=(
     "$TOPIC_TREE"
     "$TOPIC_MODEL"
     "$TOPIC_SCORE"
-    "$TOPIC_DRIFT"
+    "$TOPIC_FEATURE_DRIFT"
     "$TOPIC_DRIFT_ROUND"
 )
+
+# 单 topic 的 partition 数:source-topic 用 SOURCE_PARTITIONS (Fork 1=1, Fork 2/EXP3=P_d),
+# 其余协议性 topic 用 TOPIC_PARTITIONS (=1)
+partitions_for() {
+    local t="$1"
+    if [[ "$t" == "$TOPIC_SOURCE" ]]; then
+        echo "${SOURCE_PARTITIONS:-1}"
+    else
+        echo "$TOPIC_PARTITIONS"
+    fi
+}
 
 if $RECREATE; then
     echo "WARN: --recreate will DELETE all data in topics: ${TOPICS[*]}"
@@ -54,11 +66,12 @@ if $RECREATE; then
 fi
 
 for t in "${TOPICS[@]}"; do
-    echo "[create] $t (partitions=$TOPIC_PARTITIONS, replication=$TOPIC_REPLICATION)"
+    p=$(partitions_for "$t")
+    echo "[create] $t (partitions=$p, replication=$TOPIC_REPLICATION)"
     kcmd kafka-topics.sh --bootstrap-server "$BROKERS" \
         --create --if-not-exists \
         --topic "$t" \
-        --partitions "$TOPIC_PARTITIONS" \
+        --partitions "$p" \
         --replication-factor "$TOPIC_REPLICATION"
 done
 

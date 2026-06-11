@@ -1,123 +1,93 @@
 # ============================================================================
-# experiment-configs.yml - 实验配置矩阵
-# 所有参数名/值都已核对代码真实存在 (grep -rn src/main/java/)
+# experiment-configs.yml - 实验配置矩阵 (方向二(a) Phase 3)
+# 检测面 = per-feature IKS + 峰值-KS 确认 + 聚合器 → COMMITTED;打分面只剩
+# STABLE → COOLDOWN → WAITING → STABLE。WARN / 投票 / HDDM 置信度 维度全废。
+# 详见 HANDOVER_direction2a_phase3_arch.md。
 # ============================================================================
 
-# ---------- 实验 1: C1-C4 配置 ----------
-# 两个维度的 2x2:
-#   pauseMode (PauseMode.java):
-#     USE_OLD_FOREST           暂停期间继续用旧森林打分, HDDM 暂停
-#     BACKLOG_THEN_NEW_FOREST  数据进 backlog, 等新森林到来后批量打分
-#   warnTimeoutBehavior (WarnTimeoutBehavior.java):
-#     DISCARD   WARN 超时后丢弃 candidateTrees, 回 STABLE
-#     PROMOTE   WARN 超时后视为漂移确认, 发出新树
+# ---------- 配置矩阵 (收缩到一个维度) ----------
+# pauseMode (PauseMode.java) —— COOLDOWN/WAITING 期打分行为:
+#   USE_OLD_FOREST           继续用旧森林打分输出
+#   BACKLOG_THEN_NEW_FOREST  数据进 backlog,等新森林到来后批量打分
+# 原 C1-C4 的 warnTimeoutBehavior 维度已废 (无 WARN 子状态了)。
 configs:
-  C1:
+  USE_OLD_FOREST:
     pauseMode: USE_OLD_FOREST
-    warnTimeoutBehavior: DISCARD
-  C2:
-    pauseMode: USE_OLD_FOREST
-    warnTimeoutBehavior: PROMOTE
-  C3:
+  BACKLOG_THEN_NEW_FOREST:
     pauseMode: BACKLOG_THEN_NEW_FOREST
-    warnTimeoutBehavior: DISCARD
-  C4:
-    pauseMode: BACKLOG_THEN_NEW_FOREST
-    warnTimeoutBehavior: PROMOTE
 
-# ---------- 实验 4: 算法对比 ----------
-# detector 参数 (LocalProcessor --detector)
-# 与 LocalProcessorFunction.createDetector switch case 串完全一致。
+# ---------- 算法 (EXP4 可选) ----------
+# 主路径固定 per-feature IKS,不走 algorithms 段;EXP4 才用它切到 per-feature HDDM。
+# 旧的 score 域 HDDM_A* / HDDM_W 不再驱动主实验,仅留作 EXP4 对照备用。
 algorithms:
-  HDDM_A:
-    detector: HDDM_A_Windowed        # 已实现 ✅
-  HDDM_A_Cumulative:
-    detector: HDDM_A                 # 已实现 ✅ (累积版, 非窗口)
-  HDDM_W:
-    detector: HDDM_W                 # v4.0 已实现 ✅ (detector 串是 HDDM_W, 不是 HDDM_W_Windowed)
-  IKS:
-    detector: IKS                    # v5.0 已实现 ✅
+  # 默认主路径:per-feature IKS (无需在此显式注册)
+  # EXP4: per-feature HDDM 备用,等 PerFeatureHDDMFunction 实现后开放
+  # HDDM_A:
+  #   detector: HDDM_A_Windowed
+  # HDDM_W:
+  #   detector: HDDM_W
 
 # ---------- 实验计划 ----------
 plans:
-  # smoke_batch: 批量调度验证 (synth_abrupt x 4配置 x 1次 = 4)
+  # smoke_batch: 批量调度验证 (synth_abrupt × 2 pauseMode × 1 = 2)
   # 用途: 验证 run-batch.sh 串行调度 + 实验间 topic 清理 + 断点续跑
-  # 不是正式实验, 验证完可忽略
   smoke_batch:
     datasets: [synth_abrupt]
-    configs: [C1, C2, C3, C4]
+    configs: [USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST]
     repeats: 1
 
-  # 实验 1: 漂移检测 (6 数据集 x 4 配置 x 5 重复 = 120)
+  # EXP1 (核心): 新臂 across P — 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率。
+  # 网格 = datasets × P∈{1,2,4} × pauseMode × repeats[3]
+  # 三观测项 (恢复曲线 / v1-v2 森林对比 / 重训频率) 离线从 scores.jsonl + model-topic.jsonl
+  # 重建,见 HANDOVER 附录 B。
+  # 旧臂 (score 行并行) 不在本 plan;若需对比,切到 Phase 3 前的 build 跑同网格,
+  # 或直接引用 finding 1 已记录的稀释数 (INSECTS abrupt:p=1→342 WARN, p=4→0)。
   exp1:
     datasets:
       - synth_abrupt
-      - synth_gradual
-      - synth_incremental
-      - synth_reoccurring
       - insects_abrupt_imbalanced
       - insects_gradual_imbalanced
-    configs: [C1, C2, C3, C4]
-    repeats: 5
-
-  # 实验 1 的 HDDM_W 算法版 (与 exp1 同样的 datasets/configs/repeats, 只切换算法)
-  # 跑完后可与 exp1 (HDDM_A_Windowed 默认) 的结果做算法对比
-  # plan_extras: 整个 plan 共用的额外参数, 注入到每行 extra 列 → run-experiment 翻译为 --hddmLambda 0.1
-  exp1_hddm_w:
-    datasets:
-      - synth_abrupt
-      - synth_gradual
-      - synth_incremental
-      - synth_reoccurring
-      - insects_abrupt_imbalanced
-      - insects_gradual_imbalanced
-    configs: [C1, C2, C3, C4]
-    algorithms: [HDDM_W]
-    repeats: 5
+    configs: [USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST]
+    parallelism_grid: [1, 2, 4]
+    repeats: 3
     plan_extras:
-      hddmLambda: 0.1
+      iksWindowSize: 2000
+      iksPValue: 0.001
+      aggK: 2
 
-  # 实验 2: stationary AUC (5 数据集 x 30 shuffle = 150)
-  # 注: 用 C1 (代码默认配置), 每次 shuffle 用不同 seed
+  # EXP2: stationary 误触发率 (5 数据集 × 30 shuffle = 150)
+  # per-feature 在无漂移流上应几乎不 fire = 精度基线;config 取 USE_OLD_FOREST 即可。
   exp2:
     datasets: [donors, http, forestcover, fraud, mulcross]
-    configs: [C1]
+    configs: [USE_OLD_FOREST]
     repeats: 30
-    shuffle: true              # 每次重复用不同 seed shuffle 数据
+    shuffle: true
 
-  # 实验 3: 可扩展性 (2 数据集 x 4 parallelism x 3 重复 = 24)
+  # EXP3: 扩展性 + Fork 2 (source partition=P) — 2 数据集 × 4 P × 3 repeat = 24
+  # 升 Fork 2 时改 .env 的 SOURCE_PARTITIONS=P_d (脚本默认 Fork 1 = 1)。
   exp3:
     datasets: [donors, http]
-    configs: [C4]
+    configs: [BACKLOG_THEN_NEW_FOREST]
     parallelism_grid: [1, 2, 4, 6]
     repeats: 3
 
-  # 实验 4: 算法对比 (3 数据集 x 3 算法 x 5 重复 = 45)
+  # EXP4 (可选): per-feature IKS vs per-feature HDDM,等 PerFeatureHDDMFunction 落地再开。
   exp4:
-    datasets: [synth_abrupt, insects_gradual_imbalanced, synth_incremental]
-    configs: [C4]
-    algorithms: [HDDM_A, HDDM_W, IKS]
-    repeats: 5
-    enabled: true
+    datasets: [synth_abrupt, insects_abrupt_imbalanced]
+    configs: [BACKLOG_THEN_NEW_FOREST]
+    repeats: 3
+    enabled: false
 
-  # Sensitivity: 参数敏感性 (单数据集, 扫描 3 个参数)
+  # Sensitivity: 参数敏感性 (单数据集, OAT 扫 4 个参数)
+  # 旧的 hddmWindowSize 改为 iksWindowSize;新增 aggK / ksConfirm 两个检测面维度;
+  # ringBufferSize / cooldownSamples 保留 (打分面 COOLDOWN 仍有)。
   sensitivity:
     dataset: synth_abrupt
-    config: C4
+    config: BACKLOG_THEN_NEW_FOREST
     grids:
+      iksWindowSize: [1000, 2000, 4000]
+      aggK: [1, 2, 3]
+      ksConfirm: [0.04, 0.05, 0.08, 0.12]
       ringBufferSize: [256, 512, 1000, 2000]
-      hddmWindowSize: [1000, 2000, 4000]
       cooldownSamples: [1000, 2000, 5000]
-    repeats: 3
-
-  # 敏感性测试：HDDM 置信度参数（成对放宽倍率扫描）
-  # 基线 + 10× / 20× / 40× 放宽，看 stable 假阳率随阈值放宽如何变化
-  sensitivity_hddm_conf:
-    dataset: insects_abrupt_imbalanced
-    config: C4
-    configurations:
-      - { warnConfidence: 0.005, driftConfidence: 0.001 }   # 基线
-      - { warnConfidence: 0.05,  driftConfidence: 0.01  }   # 10×
-      - { warnConfidence: 0.1,   driftConfidence: 0.02  }   # 20×
-      - { warnConfidence: 0.2,   driftConfidence: 0.04  }   # 40× 上限对照
     repeats: 3

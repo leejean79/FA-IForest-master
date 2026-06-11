@@ -48,15 +48,20 @@ TOPICS=(
     "$TOPIC_TREE"
     "$TOPIC_MODEL"
     "$TOPIC_SCORE"
-    "$TOPIC_DRIFT"
+    "$TOPIC_FEATURE_DRIFT"
     "$TOPIC_DRIFT_ROUND"
 )
 
-# 单 topic 的 partition 数: output-scores 用参数值, 其他用 TOPIC_PARTITIONS (=1)
+# 单 topic 的 partition 数:
+#   - output-scores 用 --score-partitions 参数值 (随 LocalProcessor parallelism 变);
+#   - source-topic  用 SOURCE_PARTITIONS (Fork 1 v1=1;Fork 2/EXP3=P_d);
+#   - 其余协议性 topic 用 TOPIC_PARTITIONS (=1)。
 partitions_for() {
     local t="$1"
     if [[ "$t" == "$TOPIC_SCORE" ]]; then
         echo "$SCORE_PARTITIONS"
+    elif [[ "$t" == "$TOPIC_SOURCE" ]]; then
+        echo "${SOURCE_PARTITIONS:-1}"
     else
         echo "$TOPIC_PARTITIONS"
     fi

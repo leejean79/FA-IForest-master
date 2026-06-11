@@ -6,9 +6,9 @@
 #        → 收集结果 → 清理
 #
 # 用法 / Usage:
-#   bash run-experiment.sh --dataset http --config-id C1 --run-id 1
-#   bash run-experiment.sh --dataset donors --config-id C4 --run-id 1 --parallelism 2
-#   bash run-experiment.sh --dataset http --config-id C1 --run-id 5 --shuffle  # 实验2
+#   bash run-experiment.sh --dataset http --config-id USE_OLD_FOREST --run-id 1
+#   bash run-experiment.sh --dataset donors --config-id BACKLOG_THEN_NEW_FOREST --run-id 1 --parallelism 2
+#   bash run-experiment.sh --dataset http --config-id USE_OLD_FOREST --run-id 5 --shuffle  # EXP2
 #
 # 退出码 / Exit codes:
 #   0 成功 / 1 超时 / 2 job失败 / 3 参数或数据错
@@ -53,7 +53,6 @@ ANOMALY_LABEL=$($CFG dataset "$DATASET" anomalyLabel)
 
 # ---------- 查配置 ----------
 PAUSE_MODE=$($CFG config "$CONFIG_ID" pauseMode)
-WARN_BEHAVIOR=$($CFG config "$CONFIG_ID" warnTimeoutBehavior)
 
 # ---------- 算法 (实验4, 可选) ----------
 DETECTOR=""
@@ -91,8 +90,9 @@ fi
 echo "════════════════════════════════════════════════════"
 echo "EXPERIMENT: $EXP_ID"
 echo "  dataset=$DATASET (n=$N_SAMPLES, header=$HAS_HEADER, id=$HAS_ID)"
-echo "  config=$CONFIG_ID (pause=$PAUSE_MODE, warn=$WARN_BEHAVIOR)"
-echo "  parallelism=$PARALLELISM  detector=${DETECTOR:-default}"
+echo "  config=$CONFIG_ID (pause=$PAUSE_MODE)"
+echo "  parallelism=$PARALLELISM  detector=${DETECTOR:-default(per-feature IKS)}"
+echo "  extra=${EXTRA_PARAM:-(none)}"
 echo "  result → master:$RESULT_DIR"
 echo "════════════════════════════════════════════════════"
 
@@ -178,17 +178,31 @@ echo "  dumper running ok"
 
 # ============================================================================
 # Step 4: 提交两个 Flink job (后台)
+# extra-param 同时透传给 Coordinator + LocalProcessor:聚合器的 aggK / aggWin /
+# refractory 走 CoordinatorJob;iksWindowSize / iksPValue / confirmWin / ksConfirm
+# 走 LocalProcessor。Flink ParameterTool 对未知 key 静默忽略,整串直接传两侧即可。
 # ============================================================================
 echo ""
 echo "[4/9] submit jobs ..."
-# Coordinator
+
+# extra-param 通用翻译:k=v[;k2=v2] → --k v --k2 v2
+EXTRA_ARGS=""
+if [[ -n "$EXTRA_PARAM" ]]; then
+    IFS=';' read -ra PAIRS <<< "$EXTRA_PARAM"
+    for pair in "${PAIRS[@]}"; do
+        k="${pair%%=*}"; v="${pair##*=}"
+        EXTRA_ARGS="$EXTRA_ARGS --$k $v"
+    done
+fi
+
+# Coordinator (聚合器参数从 EXTRA_ARGS 拿;Flink 忽略未知 key)
 COORD_OUT=$(ssh_master "docker exec jobmanager flink run -d \
     -c $JOB_COORDINATOR_MAIN -p $JOB_COORDINATOR_PARALLELISM $JAR \
     --broker $BROKERS \
     --treeTopic $TOPIC_TREE --modelTopic $TOPIC_MODEL \
-    --driftTopic $TOPIC_DRIFT --driftRoundTopic $TOPIC_DRIFT_ROUND \
+    --featureDriftTopic $TOPIC_FEATURE_DRIFT --driftRoundTopic $TOPIC_DRIFT_ROUND \
     --parallelism $PARALLELISM --totalTrees $JOB_TOTAL_TREES \
-    --votingTimeoutMs $JOB_VOTING_TIMEOUT_MS" 2>&1)
+    $EXTRA_ARGS" 2>&1)
 COORD_JID=$(echo "$COORD_OUT" | grep -oE 'JobID [a-f0-9]{32}' | awk '{print $2}' | head -1)
 [[ -z "$COORD_JID" ]] && {
     echo "coordinator submit failed: $COORD_OUT"
@@ -203,24 +217,18 @@ for _ in $(seq 1 12); do
     sleep 5
 done
 
-# LocalProcessor (HDDM 参数: pauseMode + warnTimeoutBehavior + 可选 detector + extra)
+# LocalProcessor (检测面 + 打分面;无 WARN/投票/HDDM 置信度)
 LOCAL_ARGS="--broker $BROKERS --topic $TOPIC_SOURCE \
     --treeTopic $TOPIC_TREE --modelTopic $TOPIC_MODEL \
-    --driftTopic $TOPIC_DRIFT --driftRoundTopic $TOPIC_DRIFT_ROUND \
+    --featureDriftTopic $TOPIC_FEATURE_DRIFT --driftRoundTopic $TOPIC_DRIFT_ROUND \
     --scoreTopic $TOPIC_SCORE \
     --hasHeader $HAS_HEADER --hasId $HAS_ID --hasLabel $HAS_LABEL \
     --parallelism $PARALLELISM --totalTrees $JOB_TOTAL_TREES \
     --subsampleSize $JOB_SUBSAMPLE_SIZE --ringBufferSize $JOB_RING_BUFFER_SIZE \
-    --pauseMode $PAUSE_MODE --warnTimeoutBehavior $WARN_BEHAVIOR"
+    --pauseMode $PAUSE_MODE"
+# detector 参数 (EXP4 才用) 仍允许通过 --algorithm 走 algorithms 段
 [[ -n "$DETECTOR" ]] && LOCAL_ARGS="$LOCAL_ARGS --detector $DETECTOR"
-# sensitivity: extra-param 形如 ringBufferSize=512 → --ringBufferSize 512
-if [[ -n "$EXTRA_PARAM" ]]; then
-    IFS=';' read -ra PAIRS <<< "$EXTRA_PARAM"
-    for pair in "${PAIRS[@]}"; do
-        k="${pair%%=*}"; v="${pair##*=}"
-        LOCAL_ARGS="$LOCAL_ARGS --$k $v"
-    done
-fi
+LOCAL_ARGS="$LOCAL_ARGS $EXTRA_ARGS"
 
 LOCAL_OUT=$(ssh_master "docker exec jobmanager flink run -d \
     -c $JOB_LOCAL_MAIN -p $PARALLELISM $JAR $LOCAL_ARGS" 2>&1)
@@ -329,8 +337,8 @@ import os; os.replace(tmp, src)
 PY"
 fi
 
-# dump 其他 topic
-for t in "$TOPIC_DRIFT" "$TOPIC_DRIFT_ROUND" "$TOPIC_MODEL"; do
+# dump 其他 topic (EXP1 三观测项依赖:scores + model-topic + drift-round-topic + feature-drift-topic)
+for t in "$TOPIC_FEATURE_DRIFT" "$TOPIC_DRIFT_ROUND" "$TOPIC_MODEL"; do
     kcmd kafka-console-consumer.sh --bootstrap-server "$NODE_MASTER_IP:9092" \
         --topic "$t" --from-beginning --timeout-ms 5000 2>/dev/null \
         | ssh_master "cat > $RESULT_DIR/$t.jsonl" || true
@@ -351,9 +359,9 @@ ssh_master "cat > $RESULT_DIR/job-config.json <<EOF
   \"dataset\": \"$DATASET\",
   \"config_id\": \"$CONFIG_ID\",
   \"pauseMode\": \"$PAUSE_MODE\",
-  \"warnTimeoutBehavior\": \"$WARN_BEHAVIOR\",
   \"parallelism\": $PARALLELISM,
-  \"detector\": \"${DETECTOR:-default}\",
+  \"detector\": \"${DETECTOR:-default(per-feature IKS)}\",
+  \"extra_param\": \"${EXTRA_PARAM}\",
   \"n_samples\": $N_SAMPLES,
   \"final_offset\": $last_offset,
   \"status\": $STATUS,

@@ -3,7 +3,7 @@
 # 4-submit-job.sh
 # 提交 Flink jobs 到集群 (共 2 个 main 类):
 #   1. CoordinatorJob   (parallelism=1, 在 master 中央协调 iTree 聚合 + 漂移投票)
-#   2. LocalProcessor   (parallelism=8, 在 worker 上做 scoring + 漂移检测)
+#   2. LocalProcessor   (parallelism=8, 在 worker 上做 scoring + per-feature 检测)
 #
 # 用法 / Usage:
 #   bash 4-submit-job.sh                # 提交两个 (默认, 推荐)
@@ -40,7 +40,7 @@ BROKERS="$NODE_MASTER_IP:9092,$NODE_WORKER1_IP:9092,$NODE_WORKER2_IP:9092"
 TOPIC_ARGS=(
     --treeTopic "$TOPIC_TREE"
     --modelTopic "$TOPIC_MODEL"
-    --driftTopic "$TOPIC_DRIFT"
+    --featureDriftTopic "$TOPIC_FEATURE_DRIFT"
     --driftRoundTopic "$TOPIC_DRIFT_ROUND"
 )
 # 字符串化 (传给 ssh)

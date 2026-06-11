@@ -16,9 +16,9 @@ bash 原生不能解析 yaml, 用这个 helper 集中查询.
   python3 cfg_query.py dataset insects_abrupt_imbalanced drift_events
   # → 51255,74381,100944,142291,152207
 
-  # 查配置 (C1-C4)
-  python3 cfg_query.py config C1 pauseMode
-  python3 cfg_query.py config C1 warnTimeoutBehavior
+  # 查配置 (方向二(a) Phase 3:配置 id 取 pauseMode 字面值)
+  python3 cfg_query.py config USE_OLD_FOREST pauseMode
+  python3 cfg_query.py config BACKLOG_THEN_NEW_FOREST pauseMode
 
   # 查 plan (展开实验矩阵, 每行一个实验)
   python3 cfg_query.py plan exp1
@@ -103,12 +103,12 @@ def expand_plan(plan_name):
         return []
 
     datasets = plan.get("datasets", [])
-    configs = plan.get("configs", ["C1"])
+    configs = plan.get("configs", ["USE_OLD_FOREST"])
     algorithms = plan.get("algorithms", ["_"])           # _ = 不指定算法 (用 default)
     parallelism_grid = plan.get("parallelism_grid", ["_"])  # _ = 用 .env 默认
     repeats = plan.get("repeats", 1)
-    # plan_extras: 整个 plan 共用的额外参数 (k=v 字典), 比如 {hddmLambda: 0.1}
-    # 注入到每行的 extra 列, 由 run-experiment.sh 翻译成 --k v 透传给 LocalProcessor
+    # plan_extras: 整个 plan 共用的额外参数 (k=v 字典), 比如 {iksWindowSize: 2000, aggK: 2}
+    # 注入到每行的 extra 列, 由 run-experiment.sh 翻译成 --k v 同时透传给两个 Flink job
     plan_extras = plan.get("plan_extras", {})
     extras_str = ";".join(f"{k}={v}" for k, v in plan_extras.items())
 

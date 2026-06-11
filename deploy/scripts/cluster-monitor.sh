@@ -93,7 +93,7 @@ draw() {
 
     # ---- Topic offsets ----
     echo "[Kafka Topic Offsets]"
-    for t in "$TOPIC_SOURCE" "$TOPIC_TREE" "$TOPIC_MODEL" "$TOPIC_SCORE" "$TOPIC_DRIFT" "$TOPIC_DRIFT_ROUND"; do
+    for t in "$TOPIC_SOURCE" "$TOPIC_TREE" "$TOPIC_MODEL" "$TOPIC_SCORE" "$TOPIC_FEATURE_DRIFT" "$TOPIC_DRIFT_ROUND"; do
         off=$(s_master "docker exec kafka-1 kafka-run-class.sh kafka.tools.GetOffsetShell \
             --broker-list $NODE_MASTER_IP:9092 --topic $t 2>/dev/null \
             | awk -F: '{sum+=\$3} END{print sum+0}'")
