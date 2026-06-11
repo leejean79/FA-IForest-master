@@ -358,7 +358,7 @@ def mode_drift(args):
                     "first_new_version_seq": first_new, "delay_records": delay_1,
                 })
             else:
-                print(f"    定义1: 区间内未产生新版本 (HDDM 未触发或 COOLDOWN 未完成)")
+                print(f"    定义1: 区间内未产生新版本 (检测面未触发或 COOLDOWN 未完成)")
                 delays["definition_1_first_new_version"].append({
                     "drift_idx": i, "drift_point": dp, "first_new_version_seq": None, "delay_records": None,
                 })
@@ -423,6 +423,23 @@ def mode_drift(args):
                     })
 
         result["delays"] = delays
+
+        # [5.5] EXP1 顶级 headline 字段 (方向二(a) Phase 3 附录 D)
+        # 把已算好的散落字段提升到顶层,让 analyze-all.sh / dilution-summary 直接读
+        # n_retrains = 重训次数 = 出现的 forestVersion 数 - 1 (初始 v1 不算触发)
+        # delta_post_auc > 0 → 重训改善 stale-baseline;≤ 0 → 池子拖后腿 (Q3 试金石)
+        result["n_retrains"] = max_ver - 1
+        if "漂移后 v1 (旧森林)" in segments:
+            result["post_v1_auc"] = segments["漂移后 v1 (旧森林)"]["auc"]
+        if f"漂移后 v{max_ver} (最终版本)" in segments:
+            result["post_final_auc"] = segments[f"漂移后 v{max_ver} (最终版本)"]["auc"]
+        if result.get("post_v1_auc") is not None and result.get("post_final_auc") is not None:
+            result["delta_post_auc"] = result["post_final_auc"] - result["post_v1_auc"]
+        # recovery_latency:第一个漂移点的 def2 (AUC>=95% 基线) 延迟;None 表未恢复
+        d2 = delays.get("definition_2_auc_recovery", [])
+        if d2:
+            result["recovery_latency"] = d2[0].get("delay_records")
+            result["recovered"] = d2[0].get("recovery_seq") is not None
     
     # [6] 滑动窗口导出 (供画图)
     if args.window_csv:
