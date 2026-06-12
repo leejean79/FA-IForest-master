@@ -87,6 +87,8 @@ public class LocalProcessorFunction
     private transient ValueState<Long> currentRoundId;
     // 已处理的决议 roundId，防重复
     private transient ValueState<Long> lastProcessedDecision;
+    // 当前 COOLDOWN 注册的 processing-time timer 时戳（orphan-timer 防误触发）
+    private transient ValueState<Long> cooldownTimerExpiry;
 
     // ===== 运行时参数 / Runtime parameters =====
     private transient int subsampleSize;
@@ -96,6 +98,7 @@ public class LocalProcessorFunction
     private transient int ringBufferSize;
     private transient int cooldownSamples;
     private transient double zThresholdK;
+    private transient long cooldownTimeoutMs;  // COOLDOWN 卡死兜底：超时则 ABORT,保旧森林,排 backlog
     private transient PauseMode pauseMode;
 
 
@@ -128,6 +131,8 @@ public class LocalProcessorFunction
                 new ValueStateDescriptor<>("current-round-id", Types.LONG));
         lastProcessedDecision = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("last-processed-decision", Types.LONG));
+        cooldownTimerExpiry = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("cooldown-timer-expiry", Types.LONG));
 
         ParameterTool params = (ParameterTool) getRuntimeContext()
                 .getExecutionConfig().getGlobalJobParameters();
@@ -150,12 +155,13 @@ public class LocalProcessorFunction
 
         cooldownSamples = params.getInt("cooldownSamples", 2000);
         zThresholdK = params.getDouble("zThresholdK", 1.0);
+        cooldownTimeoutMs = params.getLong("cooldownTimeoutMs", 60_000L);
 
         String pauseModeStr = params.get("pauseMode", "USE_OLD_FOREST");
         pauseMode = PauseMode.valueOf(pauseModeStr);
 
-        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, pauseMode={}",
-                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, pauseMode);
+        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, cooldownTimeoutMs={}, pauseMode={}",
+                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, cooldownTimeoutMs, pauseMode);
 
     }
 
@@ -234,7 +240,7 @@ public class LocalProcessorFunction
                 && decision.getStatus() == DriftRoundMessage.RoundStatus.COMMITTED) {
             Long lastDecision = lastProcessedDecision.value();
             if (lastDecision == null || lastDecision != decision.getRoundId()) {
-                handleCommitted(decision);
+                handleCommitted(decision, ctx);
                 lastProcessedDecision.update(decision.getRoundId());
                 st = subState.value();
                 if (st == null) st = PhaseCSubState.STABLE;
@@ -272,10 +278,10 @@ public class LocalProcessorFunction
     /**
      * 收到聚合器合成的 COMMITTED → 进 COOLDOWN，记录 roundId 用作 retrain batchId。
      */
-    private void handleCommitted(DriftRoundMessage decision) throws Exception {
+    private void handleCommitted(DriftRoundMessage decision, ReadOnlyContext ctx) throws Exception {
         long roundId = decision.getRoundId();
         currentRoundId.update(roundId);
-        enterCooldown();
+        enterCooldown(ctx);
         LOG.info("subtask={}: COMMITTED round {} → COOLDOWN", subtaskIndex, roundId);
     }
 
@@ -366,13 +372,22 @@ public class LocalProcessorFunction
         }
     }
 
-    private void enterCooldown() throws Exception {
+    private void enterCooldown(ReadOnlyContext ctx) throws Exception {
         subState.update(PhaseCSubState.COOLDOWN);
         cooldownN.update(0L);
         cooldownMean.update(0.0);
         cooldownM2.update(0.0);
         cooldownWrites.update(0L);
-        LOG.info("subtask={}: entered COOLDOWN", subtaskIndex);
+
+        // 注册 processing-time timer：cooldownTimeoutMs 后若仍在 COOLDOWN 即 ABORT，
+        // 保旧森林、排 backlog、回 STABLE。无界流（在线部署）变安静时能退出；
+        // 有界流（实验）EOF 不一定触发 timer，故 EXP1 还依赖 run-experiment.sh 的 Fix B 兜底。
+        long expiry = ctx.timerService().currentProcessingTime() + cooldownTimeoutMs;
+        ctx.timerService().registerProcessingTimeTimer(expiry);
+        cooldownTimerExpiry.update(expiry);
+
+        LOG.info("subtask={}: entered COOLDOWN (timer expiry={} → +{}ms)",
+                subtaskIndex, expiry, cooldownTimeoutMs);
     }
 
     @SuppressWarnings("unchecked")
@@ -434,9 +449,70 @@ public class LocalProcessorFunction
         cooldownMean.clear();
         cooldownM2.clear();
         cooldownWrites.clear();
+        // 清掉本轮 COOLDOWN 注册的 abort timer（正常完成走重训路径）
+        Long expiry = cooldownTimerExpiry.value();
+        if (expiry != null) {
+            ctx.timerService().deleteProcessingTimeTimer(expiry);
+            cooldownTimerExpiry.clear();
+        }
 
         LOG.info("subtask={}: entering WAITING (waiting for version > {})",
                 subtaskIndex, currentForestVersion);
+    }
+
+    /**
+     * COOLDOWN 兜底:数据不足以训出有意义的新森林 → 放弃本轮重训,保留当前森林,
+     * 排空 backlog,回 STABLE。语义是「正确退化」而非降级。
+     *
+     * 触发源:onTimer 在 cooldownTimeoutMs 到期且仍在 COOLDOWN 时调用。
+     */
+    private void abortCooldown(OnTimerContext ctx, Collector<ScoreResult> out) throws Exception {
+        Forest forest = ctx.getBroadcastState(FOREST_DESC).get(FOREST_KEY);
+        long currentForestVersion = (forest != null) ? forest.getVersion() : 0L;
+
+        // BACKLOG 模式:COOLDOWN 期堆积的样本必须用「当前(旧)」森林打分排空,
+        // 否则这些记录从 output-scores 永远消失。USE_OLD_FOREST 模式 COOLDOWN
+        // 期数据本就是即时 emit,无需排空。
+        int drained = 0;
+        if (pauseMode == PauseMode.BACKLOG_THEN_NEW_FOREST && forest != null) {
+            List<DataPoint> blList = new ArrayList<>();
+            for (DataPoint dp : backlog.get()) {
+                blList.add(dp);
+            }
+            for (DataPoint dp : blList) {
+                double s = forest.score(dp.getFeatures());
+                out.collect(buildScoreResult(dp, s, currentForestVersion, "C", 0L));
+            }
+            backlog.clear();
+            drained = blList.size();
+        }
+
+        subState.update(PhaseCSubState.STABLE);
+        cooldownN.clear();
+        cooldownMean.clear();
+        cooldownM2.clear();
+        cooldownWrites.clear();
+        cooldownTimerExpiry.clear();
+        currentRoundId.clear();
+
+        LOG.warn("subtask={}: COOLDOWN ABORTED (insufficient data before timeout), " +
+                "kept forest v{}, flushed {} backlog records",
+                subtaskIndex, currentForestVersion, drained);
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<ScoreResult> out) throws Exception {
+        // 只有「当前在 COOLDOWN 且 timestamp 是本轮注册的 expiry」才触发 abort,
+        // 防 orphan timer(上一轮 COOLDOWN 已正常完成但 timer 还在队列)误触发。
+        PhaseCSubState st = subState.value();
+        if (st != PhaseCSubState.COOLDOWN) {
+            return;
+        }
+        Long expectedExpiry = cooldownTimerExpiry.value();
+        if (expectedExpiry == null || expectedExpiry != timestamp) {
+            return;
+        }
+        abortCooldown(ctx, out);
     }
 
     @SuppressWarnings("unchecked")

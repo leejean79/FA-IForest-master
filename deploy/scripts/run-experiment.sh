@@ -2,8 +2,8 @@
 # ============================================================================
 # run-experiment.sh - 单次实验完整流程
 #
-# 9 步: 解析 → 清topic → (shuffle) → 起Dumper → 提交job → 灌数据 → 等完成
-#        → 收集结果 → 清理
+# 9 步: 解析 → 清topic → 备结果目录 → 提交job → 灌数据 → 等完成(stable-K)
+#        → 一次性 dump (--max-messages EXPECTED) → 清理
 #
 # 用法 / Usage:
 #   bash run-experiment.sh --dataset http --config-id USE_OLD_FOREST --run-id 1
@@ -147,34 +147,14 @@ PY"
 fi
 
 # ============================================================================
-# Step 3: 启动 ScoreResultDumper (临时容器, idle 退出)
+# Step 3: 准备结果目录(Fix B:不再启用 ScoreResultDumper 容器,改 Step 7 一次性
+#         按 latest-offset 总数 console-consumer --max-messages EXPECTED 收尾,
+#         避免空闲超时导致末段卡死时的确定性截断)
 # ============================================================================
 echo ""
-echo "[3/9] start dumper ..."
+echo "[3/9] prepare result dir ..."
 ssh_master "mkdir -p $RESULT_DIR && chmod 777 $RESULT_DIR"
-DUMPER_NAME="dumper-$EXP_ID"
-# 防御: 清掉同名残留容器 (上次失败可能没 cleanup, 同名冲突会让 docker run 失败)
-ssh_master "docker rm -f $DUMPER_NAME >/dev/null 2>&1" || true
-# 30s idle timeout: 给 Phase B 训树留时间
-ssh_master "docker run -d --name $DUMPER_NAME --network host --user root \
-    -v $RESULT_DIR:/out \
-    -v $REMOTE_HOME/jars:/jars \
-    fa-iforest/flink:$FLINK_VERSION \
-    java -cp /jars/$JOB_JAR_NAME com.leejean.tools.ScoreResultDumper \
-    $NODE_MASTER_IP:9092 $TOPIC_SCORE /out/scores.jsonl 30000" >/dev/null 2>&1 \
-    || { echo "dumper start failed"; exit 2; }
-
-# 健康检查: 启动 3 秒后确认 Dumper 还活着 (不是启动即挂)
-sleep 3
-dumper_state=$(ssh_master "docker inspect -f '{{.State.Status}}' $DUMPER_NAME 2>/dev/null")
-if [[ "$dumper_state" != "running" ]]; then
-    echo "ERROR: dumper 启动即退出 (state=$dumper_state)"
-    echo "--- dumper 日志 ---"
-    ssh_master "docker logs $DUMPER_NAME 2>&1 | tail -20"
-    ssh_master "docker rm $DUMPER_NAME >/dev/null 2>&1" || true
-    exit 2
-fi
-echo "  dumper running ok"
+echo "  $RESULT_DIR ready"
 
 # ============================================================================
 # Step 4: 提交两个 Flink job (后台)
@@ -206,7 +186,7 @@ COORD_OUT=$(ssh_master "docker exec jobmanager flink run -d \
 COORD_JID=$(echo "$COORD_OUT" | grep -oE 'JobID [a-f0-9]{32}' | awk '{print $2}' | head -1)
 [[ -z "$COORD_JID" ]] && {
     echo "coordinator submit failed: $COORD_OUT"
-    ssh_master "docker stop $DUMPER_NAME >/dev/null 2>&1; docker rm $DUMPER_NAME >/dev/null 2>&1" || true
+    : # Fix B: dumper container 已废,无清理
     exit 2
 }
 
@@ -235,7 +215,7 @@ LOCAL_OUT=$(ssh_master "docker exec jobmanager flink run -d \
 LOCAL_JID=$(echo "$LOCAL_OUT" | grep -oE 'JobID [a-f0-9]{32}' | awk '{print $2}' | head -1)
 [[ -z "$LOCAL_JID" ]] && {
     echo "local submit failed: $LOCAL_OUT"
-    ssh_master "docker stop $DUMPER_NAME >/dev/null 2>&1; docker rm $DUMPER_NAME >/dev/null 2>&1" || true
+    : # Fix B: dumper container 已废,无清理
     ssh_master "docker exec jobmanager flink cancel $COORD_JID" >/dev/null 2>&1 || true
     exit 2
 }
@@ -261,15 +241,24 @@ LOAD_END=$(date +%s)
 echo "  数据灌入完成 (耗时 $((LOAD_END - LOAD_START))s), source-topic 已就绪"
 
 # ============================================================================
-# Step 6: 等完成 (两段超时: LOAD + PROCESS)
+# Step 6: 等完成 (Fix B 容差版:offset==N_SAMPLES OR 连续 N 次轮询不动)
+#
+# 旧版死等 offset==N_SAMPLES → 末段一次伪 COMMITTED → 全 subtask COOLDOWN 卡死
+# 且数据不足以让 COOLDOWN 自然完成 → 整步永远超时,scores.jsonl 还被 idle 截断。
+# 新版:offset 连续 STABLE_POLLS 次不动 → 视为「管线已尽力」→ 退到 Step 7 一次性
+# 收尾;Java 端 Fix A 的 ABORT timer 是部署级兜底(无界流),实验靠这里。
 # ============================================================================
 echo ""
-echo "[6/9] wait for completion (target offset=$N_SAMPLES) ..."
+echo "[6/9] wait for completion (target offset=$N_SAMPLES, stable-K tolerance) ..."
 LOAD_TIMEOUT=$(( N_SAMPLES / JOB_LOAD_RATE * 3 / 2 + 60 ))   # 1.5x 灌入时间 + 60s
 PROCESS_TIMEOUT=600                                          # 灌完后 10 分钟
 DEADLINE=$(( $(date +%s) + LOAD_TIMEOUT + PROCESS_TIMEOUT ))
 
+STABLE_POLLS=5         # 连续 N 次轮询 offset 不动 = 视为完成
+POLL_INTERVAL=10       # 每 10 秒一轮 → 50s no-progress 即收尾
+
 last_offset=0
+stable_count=0
 STATUS=1   # 默认失败, 循环里成功才置 0
 while true; do
     now=$(date +%s)
@@ -277,51 +266,83 @@ while true; do
         echo "  TIMEOUT after $((LOAD_TIMEOUT + PROCESS_TIMEOUT))s (offset=$last_offset/$N_SAMPLES)"
         STATUS=1; break
     fi
-    # 查 output-scores 总 offset (4 partition 求和)
+    # 查 output-scores 总 offset (所有 partition 求和)
     offset=$(kcmd kafka-run-class.sh kafka.tools.GetOffsetShell \
         --broker-list "$NODE_MASTER_IP:9092" --topic "$TOPIC_SCORE" 2>/dev/null \
         | awk -F: '{sum+=$3} END{print sum+0}')
-    last_offset="$offset"
     if [[ "$offset" -ge "$N_SAMPLES" ]]; then
         echo "  DONE (offset=$offset >= $N_SAMPLES)"
+        last_offset="$offset"
         STATUS=0; break
     fi
-    pct=$(( offset * 100 / N_SAMPLES ))
-    echo "  progress: $offset / $N_SAMPLES ($pct%)"
-    sleep 10
+    # stable 检测:offset 和上一次相同 → 计数 +1;不同 → 重置
+    if [[ "$offset" -eq "$last_offset" ]]; then
+        stable_count=$((stable_count + 1))
+        if [[ "$stable_count" -ge "$STABLE_POLLS" ]]; then
+            echo "  STABLE-EARLY-EXIT (offset=$offset 连续 ${STABLE_POLLS} 次不动, " \
+                 "未达目标 $N_SAMPLES;管线可能末段卡死 → 进 dump 收尾)"
+            STATUS=0; break
+        fi
+        pct=$(( offset * 100 / N_SAMPLES ))
+        echo "  progress: $offset / $N_SAMPLES ($pct%) [stable ${stable_count}/${STABLE_POLLS}]"
+    else
+        stable_count=0
+        last_offset="$offset"
+        pct=$(( offset * 100 / N_SAMPLES ))
+        echo "  progress: $offset / $N_SAMPLES ($pct%)"
+    fi
+    sleep "$POLL_INTERVAL"
 done
 
 # ============================================================================
-# Step 7: 收集结果
+# Step 7: 收集结果 (Fix B:job 停后,按 latest-offset 总数一次性 dump scores)
+#
+# 旧版用 ScoreResultDumper 容器流式写盘 + 30s idle timeout 退出 → 末段卡死时
+# 出现「无新消息 ≥ 30s」会被 idle 超时早退,确定性截断到 ~124k(实测案例)。
+# 新版:job 停 → 求 EXPECTED = sum(partition latest offsets) → console-consumer
+# --max-messages EXPECTED 读满即停,不靠空闲超时。
 # ============================================================================
 echo ""
 echo "[7/9] collect results ..."
-# cancel jobs (停止产生新 score)
+# cancel jobs (停止产生新 score),并等其退出,防 dump 时 producer 仍在追加
 ssh_master "docker exec jobmanager flink cancel $LOCAL_JID" >/dev/null 2>&1 || true
 ssh_master "docker exec jobmanager flink cancel $COORD_JID" >/dev/null 2>&1 || true
+# 等 cancel 落地;5s 通常足够 source/sink 清理
+sleep 5
 
-# 等 Dumper 消费完剩余消息后自然退出 (它 30s idle 自动退; 这里最多等 90s)
-echo "  waiting for dumper to finish writing scores.jsonl ..."
-for _ in $(seq 1 18); do
-    st=$(ssh_master "docker inspect -f '{{.State.Status}}' $DUMPER_NAME 2>/dev/null")
-    [[ "$st" != "running" ]] && break
-    sleep 5
-done
+# 求 EXPECTED:各 partition 的 latest offset 之和
+EXPECTED=$(kcmd kafka-run-class.sh kafka.tools.GetOffsetShell \
+    --broker-list "$NODE_MASTER_IP:9092" --topic "$TOPIC_SCORE" --time -1 2>/dev/null \
+    | awk -F: '{s+=$NF} END{print s+0}')
+echo "  EXPECTED scores = $EXPECTED (latest offsets sum)"
 
-# 校验 scores.jsonl 真的写出来了 (避免 Dumper 假成功)
-score_lines=$(ssh_master "wc -l < $RESULT_DIR/scores.jsonl 2>/dev/null" || echo 0)
-score_lines=$(echo "$score_lines" | tr -d ' ')
-if [[ "${score_lines:-0}" -lt 1 ]]; then
-    echo "  ERROR: scores.jsonl 为空或不存在 (Dumper 可能挂了)"
-    echo "  --- dumper 日志 ---"
-    ssh_master "docker logs $DUMPER_NAME 2>&1 | tail -20" || true
+if [[ "${EXPECTED:-0}" -lt 1 ]]; then
+    echo "  ERROR: $TOPIC_SCORE 为空(EXPECTED=0),job 可能从未产分数"
     STATUS=2
 else
-    echo "  scores.jsonl: $score_lines 行"
-    # 字段映射: ScoreResult 序列化用 originalSequence/dataPointId,
-    # 但 analyze_old.py 要 seq/id. 逐行 rename, 不改 Java 也不改 analyze_old.py.
-    echo "  mapping fields (originalSequence→seq, dataPointId→id) ..."
-    ssh_master "python3 - <<'PY'
+    # console-consumer --max-messages：读满即停,不靠空闲超时
+    # 走 master 容器写出 → 落 master 盘
+    echo "  dump $TOPIC_SCORE → scores.jsonl (--max-messages $EXPECTED) ..."
+    ssh_master "docker exec kafka-1 kafka-console-consumer.sh \
+        --bootstrap-server $NODE_MASTER_IP:9092 \
+        --topic $TOPIC_SCORE --from-beginning --max-messages $EXPECTED \
+        > $RESULT_DIR/scores.jsonl 2>/dev/null" || true
+
+    score_lines=$(ssh_master "wc -l < $RESULT_DIR/scores.jsonl 2>/dev/null" || echo 0)
+    score_lines=$(echo "$score_lines" | tr -d ' ')
+    if [[ "${score_lines:-0}" -lt 1 ]]; then
+        echo "  ERROR: scores.jsonl 为空(console-consumer 可能没消费到)"
+        STATUS=2
+    else
+        if [[ "$score_lines" -lt "$EXPECTED" ]]; then
+            echo "  WARN: dump 不足 ($score_lines / $EXPECTED 行)"
+        else
+            echo "  scores.jsonl: $score_lines 行 (与 EXPECTED 一致)"
+        fi
+        # 字段映射: ScoreResult 序列化用 originalSequence/dataPointId,
+        # 但 analyze.py 要 seq/id. 逐行 rename。
+        echo "  mapping fields (originalSequence→seq, dataPointId→id) ..."
+        ssh_master "python3 - <<'PY'
 import json
 src='$RESULT_DIR/scores.jsonl'
 tmp=src+'.tmp'
@@ -335,6 +356,7 @@ with open(src) as fi, open(tmp,'w') as fo:
         fo.write(json.dumps(r)+'\n')
 import os; os.replace(tmp, src)
 PY"
+    fi
 fi
 
 # dump 其他 topic (EXP1 三观测项依赖:scores + model-topic + drift-round-topic + feature-drift-topic)
@@ -377,7 +399,7 @@ ssh_master "docker logs jobmanager 2>&1 | tail -100 > $RESULT_DIR/runtime.log" |
 # ============================================================================
 echo ""
 echo "[8/9] cleanup ..."
-ssh_master "docker stop $DUMPER_NAME >/dev/null 2>&1; docker rm $DUMPER_NAME >/dev/null 2>&1" || true
+# Fix B: dumper container 已废,无清理
 $SHUFFLE && ssh_master "rm -f $ACTIVE_CSV" || true
 
 # ============================================================================
