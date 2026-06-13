@@ -79,7 +79,9 @@ public class LocalProcessorFunction
 
     // COOLDOWN 相关 state / COOLDOWN-related state
     private transient ValueState<Long> cooldownN;        // COOLDOWN 期内样本数
-    // D1a: cooldownMean/cooldownM2 已删 (旧 z-score 过滤的 Welford 统计无人再读)
+    // 旧 z-score 过滤的 Welford 统计;d1a 路径下两者皆空，仅 legacy 路径仍消费
+    private transient ValueState<Double> cooldownMean;   // Welford mean (legacy 路径)
+    private transient ValueState<Double> cooldownM2;     // Welford M2   (legacy 路径)
     private transient ValueState<Long> cooldownWrites;   // ringBuffer 实际写入数
 
     // 当前进行中的 roundId（聚合器分配，用于 retrain batchId）
@@ -98,6 +100,12 @@ public class LocalProcessorFunction
     private transient int cooldownSamples;
     private transient double zThresholdK;
     private transient long cooldownTimeoutMs;  // COOLDOWN 卡死兜底：超时则 ABORT,保旧森林,排 backlog
+    // D1a 对照开关 (HANDOVER_d1a_cooldown_nofilter §对照开关):
+    //   "legacy" (默认): 不清空 ringBuffer + z-score 过滤选样
+    //   "d1a":           进 COOLDOWN 显式清空 + 无条件写入 (post-drift 全部入池)
+    private transient String cooldownPolicy;
+    private static final String COOLDOWN_POLICY_LEGACY = "legacy";
+    private static final String COOLDOWN_POLICY_D1A = "d1a";
     private transient PauseMode pauseMode;
 
 
@@ -119,6 +127,10 @@ public class LocalProcessorFunction
 
         cooldownN = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("cooldown-n", Types.LONG));
+        cooldownMean = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("cooldown-mean", Types.DOUBLE));
+        cooldownM2 = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("cooldown-m2", Types.DOUBLE));
         cooldownWrites = getRuntimeContext().getState(
                 new ValueStateDescriptor<>("cooldown-writes", Types.LONG));
 
@@ -151,12 +163,21 @@ public class LocalProcessorFunction
         cooldownSamples = params.getInt("cooldownSamples", 2000);
         zThresholdK = params.getDouble("zThresholdK", 1.0);
         cooldownTimeoutMs = params.getLong("cooldownTimeoutMs", 60_000L);
+        // D1a 对照开关:legacy = 旧 z-score 过滤路径 (默认,保持现状);
+        //             d1a    = 进 COOLDOWN 清空 ringBuffer + 无条件写入
+        cooldownPolicy = params.get("cooldownPolicy", COOLDOWN_POLICY_LEGACY);
+        if (!COOLDOWN_POLICY_LEGACY.equals(cooldownPolicy)
+                && !COOLDOWN_POLICY_D1A.equals(cooldownPolicy)) {
+            throw new IllegalArgumentException(
+                    "Unknown cooldownPolicy: " + cooldownPolicy
+                            + " (expected 'legacy' or 'd1a')");
+        }
 
         String pauseModeStr = params.get("pauseMode", "USE_OLD_FOREST");
         pauseMode = PauseMode.valueOf(pauseModeStr);
 
-        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, cooldownTimeoutMs={}, pauseMode={}",
-                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, cooldownTimeoutMs, pauseMode);
+        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, cooldownTimeoutMs={}, pauseMode={}, cooldownPolicy={}",
+                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, cooldownTimeoutMs, pauseMode, cooldownPolicy);
 
     }
 
@@ -255,7 +276,7 @@ public class LocalProcessorFunction
                 } else {
                     backlog.add(point);
                 }
-                handleCooldown(point, ctx);
+                handleCooldown(point, score, ctx);
                 break;
             case WAITING:
                 if (pauseMode == PauseMode.USE_OLD_FOREST) {
@@ -280,27 +301,60 @@ public class LocalProcessorFunction
         LOG.info("subtask={}: COMMITTED round {} → COOLDOWN", subtaskIndex, roundId);
     }
 
-    private void handleCooldown(DataPoint point, ReadOnlyContext ctx)
+    private void handleCooldown(DataPoint point, double score, ReadOnlyContext ctx)
             throws Exception {
         Long cN = cooldownN.value();
         cN = (cN == null ? 0 : cN) + 1;
         Long cWrites = cooldownWrites.value();
         if (cWrites == null) cWrites = 0L;
-
         cooldownN.update(cN);
 
-        // D1a:取消基于旧森林 score 的 z-score 过滤;post-drift 数据全部写入。
-        // 旧森林对新概念误判,基于 score 的相对门选出的是「污染分布的下半部」→
-        // 训练样本有偏 → 重训越训越坏 (insects_abrupt overall_auc 0.736、v6=0.461)。
-        // iForest 本就容忍 ~5.5% 异常污染,无需 score 过滤。
-        writeToRingBuffer(point);
-        cWrites += 1;
-        cooldownWrites.update(cWrites);
+        boolean written;
+        if (COOLDOWN_POLICY_D1A.equals(cooldownPolicy)) {
+            // D1a 路径:取消基于旧森林 score 的 z-score 过滤;post-drift 数据全部写入。
+            // 旧森林对新概念误判,基于 score 的相对门选出的是「污染分布的下半部」→
+            // 训练样本有偏 → 重训越训越坏 (insects_abrupt overall_auc 0.736、v6=0.461)。
+            // iForest 本就容忍 ~5.5% 异常污染,无需 score 过滤。
+            writeToRingBuffer(point);
+            written = true;
+        } else {
+            // legacy 路径:Welford 在线统计旧森林 score 分布,score < (mean + zThresholdK*std)
+            // 才入池 (前 50 条全收作为初始化)。
+            Double cMean = cooldownMean.value();
+            if (cMean == null) cMean = 0.0;
+            Double cM2 = cooldownM2.value();
+            if (cM2 == null) cM2 = 0.0;
+
+            double delta = score - cMean;
+            cMean += delta / cN;
+            double delta2 = score - cMean;
+            cM2 += delta * delta2;
+
+            cooldownMean.update(cMean);
+            cooldownM2.update(cM2);
+
+            written = false;
+            if (cN >= 50) {
+                double std = Math.sqrt(cM2 / (cN - 1));
+                double threshold = cMean + zThresholdK * std;
+                if (score < threshold) {
+                    writeToRingBuffer(point);
+                    written = true;
+                }
+            } else {
+                writeToRingBuffer(point);
+                written = true;
+            }
+        }
+        if (written) {
+            cWrites += 1;
+            cooldownWrites.update(cWrites);
+        }
 
         // 双终止条件 / dual termination condition
-        // (1) 正常：ringBuffer 已被新数据完全覆盖 AND 至少经过 cooldownSamples 条
-        // (2) 兜底:cN >= cooldownSamples*2 (D1a 下 cWrites==cN,(1) 通常先成立;
-        //          (2) 保留兼容 D1b 等未来重新引入过滤的场景)
+        // (1) 正常:ringBuffer 被新数据完全覆盖 AND 至少经过 cooldownSamples 条
+        // (2) 兜底:经过 cooldownSamples*2 条仍未写满 (legacy 路径下 z-score 过严时使用;
+        //         d1a 路径下 cWrites==cN,(1) 通常先成立)
         boolean fillCondition = (cWrites >= ringBufferSize) && (cN >= cooldownSamples);
         boolean fallbackCondition = (cN >= (long) cooldownSamples * 2L);
 
@@ -347,10 +401,16 @@ public class LocalProcessorFunction
     @SuppressWarnings("unchecked")
     private void enterCooldown(ReadOnlyContext ctx) throws Exception {
         subState.update(PhaseCSubState.COOLDOWN);
-        // D1a:进 COOLDOWN 即显式清空训练池,使新森林只训 post-drift 数据;
-        // 旧 z-score 过滤已废,不能再靠"覆盖整个 ring"隐式清除旧概念。
-        ringBuffer.update(new RingBuffer<DataPoint>(ringBufferSize));
+        boolean isD1a = COOLDOWN_POLICY_D1A.equals(cooldownPolicy);
+        if (isD1a) {
+            // D1a 路径:进 COOLDOWN 即显式清空训练池,使新森林只训 post-drift 数据;
+            // 取消 z-score 过滤后不能再靠"覆盖整个 ring"隐式清除旧概念。
+            ringBuffer.update(new RingBuffer<DataPoint>(ringBufferSize));
+        }
+        // legacy 路径:保持旧行为 (不清空 ringBuffer,靠覆盖整个 ring 隐式清除)
         cooldownN.update(0L);
+        cooldownMean.update(0.0);
+        cooldownM2.update(0.0);
         cooldownWrites.update(0L);
 
         // 注册 processing-time timer：cooldownTimeoutMs 后若仍在 COOLDOWN 即 ABORT，
@@ -360,8 +420,8 @@ public class LocalProcessorFunction
         ctx.timerService().registerProcessingTimeTimer(expiry);
         cooldownTimerExpiry.update(expiry);
 
-        LOG.info("subtask={}: entered COOLDOWN (ringBuffer cleared, timer expiry={} → +{}ms)",
-                subtaskIndex, expiry, cooldownTimeoutMs);
+        LOG.info("subtask={}: entered COOLDOWN (policy={}, ringBuffer cleared={}, timer expiry={} → +{}ms)",
+                subtaskIndex, cooldownPolicy, isD1a, expiry, cooldownTimeoutMs);
     }
 
     @SuppressWarnings("unchecked")
@@ -420,6 +480,8 @@ public class LocalProcessorFunction
         subState.update(PhaseCSubState.WAITING);
 
         cooldownN.clear();
+        cooldownMean.clear();
+        cooldownM2.clear();
         cooldownWrites.clear();
         // 清掉本轮 COOLDOWN 注册的 abort timer（正常完成走重训路径）
         Long expiry = cooldownTimerExpiry.value();
@@ -461,6 +523,8 @@ public class LocalProcessorFunction
 
         subState.update(PhaseCSubState.STABLE);
         cooldownN.clear();
+        cooldownMean.clear();
+        cooldownM2.clear();
         cooldownWrites.clear();
         cooldownTimerExpiry.clear();
         currentRoundId.clear();
@@ -488,10 +552,15 @@ public class LocalProcessorFunction
     @SuppressWarnings("unchecked")
     private void writeToRingBuffer(DataPoint point) throws Exception {
         RingBuffer<DataPoint> rb = ringBuffer.value();
-        if (rb != null) {
-            rb.add(point);
-            ringBuffer.update(rb);
+        // 兜底初始化:若 subtask 进 COOLDOWN 时 ringBuffer 仍为 null (例如该
+        // subtask 在 Phase B 已被全局 forest 广播跳过、或 checkpoint 恢复后
+        // 状态未挂上),legacy 路径不会显式 new,会静默丢弃 → cWrites 错涨但
+        // ring 永远空,fillCondition 触发后 retrainAndEnterWaiting 训不出树。
+        if (rb == null) {
+            rb = new RingBuffer<>(ringBufferSize);
         }
+        rb.add(point);
+        ringBuffer.update(rb);
     }
 
     /** Phase B 训练逻辑：环形缓冲区 + 分散训树。 */
