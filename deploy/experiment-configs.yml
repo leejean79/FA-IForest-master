@@ -53,7 +53,11 @@ plans:
     plan_extras:
       iksWindowSize: 2000
       iksPValue: 0.001
-      aggK: 2
+      # Route C (HANDOVER_routeC_precision_params §1):
+      # INSECTS_abrupt 上 precision_sweep 选 k=3 是触发数最少的 recall=1.0 点
+      # (n_agg_onsets=53 vs aggK=2 时的过触发);幅度门不接入,refractory 由
+      # 部署侧 COOLDOWN/WAITING 提供。persist 暂不接入(skip 建议,几乎等效)。
+      aggK: 3
 
   # EXP2: stationary 误触发率 (5 数据集 × 30 shuffle = 150)
   # per-feature 在无漂移流上应几乎不 fire = 精度基线;config 取 USE_OLD_FOREST 即可。

@@ -12,7 +12,7 @@
 
 | 实验 | plan 名 | 规模 | 数据集 | 目的 |
 |---|---|---|---|---|
-| **EXP1 (核心)** | `exp1` | 54 (3×2×3×3) | synth_abrupt + 2 INSECTS | 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率 |
+| **EXP1 (核心)** | `exp1` | 54 (3×2×3×3) | synth_abrupt + 2 INSECTS | 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率;**用 `aggK=3` (Route C 选定)** |
 | EXP2 | `exp2` | 150 (5×30) | 5 stationary | per-feature 在无漂移流上误触发率 = 精度基线 |
 | EXP3 | `exp3` | 24 (2×4×3) | donors / http | 扩展性 (P∈{1,2,4,6});Fork 2 需手动调 `.env: SOURCE_PARTITIONS` |
 | EXP4 (可选) | `exp4` | enabled: false | — | per-feature IKS vs per-feature HDDM (待 PerFeatureHDDM 落地) |
@@ -143,7 +143,7 @@ bash deploy/scripts/run-experiment.sh \
 | `iksPValue` | 0.001 | `ca=√(−0.5·ln p)≈1.858` |
 | `confirmWin` | ~W | 峰值-KS 确认窗 C |
 | `ksConfirm` | 待标定 | 幅度门 (**不得伤 recall**) |
-| `aggK` | 2 | 聚合器共发特征门 |
+| `aggK` | 2 (代码默认);**EXP1 用 3** | 聚合器共发特征门;Route C (`HANDOVER_routeC_precision_params`) 在 INSECTS_abrupt `precision_sweep` 选 k=3 是 recall=1.0 下触发数最少点 → exp1 plan_extras 已设 3 |
 | `aggWin` | W | 聚合窗 |
 | `refractory` | ~重训周期 | 去抖 |
 
@@ -151,14 +151,14 @@ bash deploy/scripts/run-experiment.sh \
 ```bash
 bash deploy/scripts/run-experiment.sh \
     --dataset synth_abrupt --config-id USE_OLD_FOREST --run-id 1 \
-    --extra-param "iksWindowSize=2000;iksPValue=0.001;aggK=2"
+    --extra-param "iksWindowSize=2000;iksPValue=0.001;aggK=3"
 ```
 启动 banner 应打出:
 - **LocalProcessor**: `IKS window size W: 2000` / `IKS pValue: 0.001` / `Confirm window C: ...` / `ksConfirm: ...`
-- **CoordinatorJob**: `Aggregator k: 2` / `Aggregator window: ...` / `Refractory: ...`
+- **CoordinatorJob**: `Aggregator k: 3` / `Aggregator window: ...` / `Refractory: ...`
 
 (extra-param 同时透传两个 job;Flink ParameterTool 对未知 key 静默忽略,所以 `aggK` 落在 CoordinatorJob、`iks*` 落在 LocalProcessor。)
-EXP_ID 形如 `synth_abrupt_USE_OLD_FOREST_default_p4_r1_iksWindowSize-2000_iksPValue-0.001_aggK-2`
+EXP_ID 形如 `synth_abrupt_USE_OLD_FOREST_default_p4_r1_iksWindowSize-2000_iksPValue-0.001_aggK-3`
 (`default` 是 algo_tag,主路径不传 `--algorithm` 时的默认值)。
 
 ---
@@ -296,7 +296,7 @@ mode: `drift` (实验1/4) / `stationary` (实验2) / `scalability` (实验3) / `
 
 实际规模(经 `experiment-configs.yml` 展开):
 - `smoke_batch` = 2 (synth_abrupt × 2 pauseMode)
-- `exp1` = 54 (3 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats),自带 plan_extras: `iksWindowSize=2000;iksPValue=0.001;aggK=2`
+- `exp1` = 54 (3 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats),自带 plan_extras: `iksWindowSize=2000;iksPValue=0.001;aggK=3`
 - `exp2` = 150 (5 stationary × 30 shuffle)
 - `exp3` = 24 (2 datasets × P∈{1,2,4,6} × 3 repeats)
 - `sensitivity` = 51 (OAT 扫 iksWindowSize / aggK / ksConfirm / ringBufferSize / cooldownSamples)
@@ -351,9 +351,9 @@ ssh fa-master "cd /opt/fa-iforest/repo && bash deploy/scripts/run-batch.sh --pla
 # 步骤 3: 单跑 1 次, 核对参数透传到检测面 banner (关键防呆 —— 两个 job 都要看!)
 ssh fa-master "cd /opt/fa-iforest/repo && RUN_MODE=local bash deploy/scripts/run-experiment.sh \
     --dataset <ds> --config-id <cfg> --run-id 1 \
-    --extra-param 'iksWindowSize=2000;iksPValue=0.001;aggK=2'"
+    --extra-param 'iksWindowSize=2000;iksPValue=0.001;aggK=3'"
 # LocalProcessor banner 必须打: IKS window size W: 2000 / IKS pValue: 0.001
-# CoordinatorJob banner 必须打: Aggregator k: 2
+# CoordinatorJob banner 必须打: Aggregator k: 3
 # 都不能是默认值。两个 banner 在不同 JobManager 日志段, 分别核对:
 #   docker logs jobmanager 2>&1 | grep -E 'IKS window|IKS pValue|Aggregator k'
 # (旧的 warnConfidence/driftConfidence 已废, 别再核对那两个)
