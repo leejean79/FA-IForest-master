@@ -312,6 +312,9 @@ class FeatureFire:
     onsets: List[int]   # sample seq where Test transitioned False -> True
     ks_seq: np.ndarray  # KS at each evaluation point (length n - W)
     eval_seq: np.ndarray  # the seq positions at which ks_seq was recorded
+    # 确认窗口模式下记录的 (过阈 seq, 该次确认窗口内 KS 峰值)。
+    # confirm_window=0(默认) 时为空,兼容 ks_min 旧 sweep。
+    crossings: List[Tuple[int, float]] = field(default_factory=list)
 
 
 class _VFastIKSSW:
@@ -363,19 +366,29 @@ class _VFastIKSSW:
 
 def per_feature_iks(X: np.ndarray, *, ca: float = CA,
                     rebase_on_fire: bool = REBASE_ON_FIRE,
-                    eval_stride: int = 1) -> List[FeatureFire]:
+                    eval_stride: int = 1,
+                    confirm_window: int = 0) -> List[FeatureFire]:
     """
     For each feature column, run IKSSW: warm-up on X[:W, d], then slide for
     i in [W, n). Records (seq, KS, fired) every `eval_stride` samples and
     returns rising-edge onsets. If rebase_on_fire, calls Update() once per
     fired onset (matches deployed reset-on-COMMITTED semantics).
+
+    `confirm_window > 0` 启用「延迟重置 + 峰值记录」(HANDOVER §3.1):
+    上升沿后不立即 Update,而是在接下来 `confirm_window` 个 eval 点内追
+    KS 峰值,窗口结束时把 (cross_seq, peak) 记入 crossings 并 Update。
+    该模式下 ksConfirm 扫描在 crossings 上做幅度过滤,真实漂移峰值高、
+    噪声峰值低 → 不损召回。`confirm_window=0`(默认)保持旧的即时 rebase
+    行为,向后兼容 ks_min sweep。
     """
     n, D = X.shape
     out: List[FeatureFire] = []
+    thr = ca * math.sqrt(2.0 / W)
     for d in range(D):
         col = X[:, d]
         ikssw = _VFastIKSSW(col[:W])
         onsets: List[int] = []
+        crossings: List[Tuple[int, float]] = []
         # pre-allocate eval arrays
         eval_positions = list(range(W, n, eval_stride))
         ks_seq = np.zeros(len(eval_positions), dtype=float)
@@ -387,27 +400,55 @@ def per_feature_iks(X: np.ndarray, *, ca: float = CA,
             next_ep = -1
         write_idx = 0
         eval_seq_list: List[int] = []
+        # 确认窗口状态机(confirm_window>0 时启用)
+        confirming = False
+        cross_seq = -1
+        peak = 0.0
+        conf_left = 0
         for i in range(W, n):
             ikssw.Increment(float(col[i]))
             if i == next_ep:
                 ks = ikssw.KS()
-                fired = ks > ca * math.sqrt(2.0 / W)
                 ks_seq[write_idx] = ks
                 eval_seq_list.append(i)
                 write_idx += 1
-                if fired and not last_fired:
-                    onsets.append(i)
-                    if rebase_on_fire:
-                        ikssw.Update()
-                        fired = False  # post-rebase KS is small again
-                last_fired = fired
+                if confirm_window > 0:
+                    # 延迟重置 + 峰值记录
+                    if not confirming:
+                        if ks > thr:
+                            onsets.append(i)               # 保留 onsets(绘图/兼容)
+                            confirming = True
+                            cross_seq = i
+                            peak = ks
+                            conf_left = confirm_window
+                    else:
+                        # CONFIRMING:不检测新过阈、不重置,只追峰
+                        if ks > peak:
+                            peak = ks
+                        conf_left -= 1
+                        if conf_left <= 0:
+                            crossings.append((cross_seq, peak))
+                            ikssw.Update()
+                            confirming = False
+                            peak = 0.0
+                            cross_seq = -1
+                else:
+                    # 旧行为:即时 rebase
+                    fired = ks > thr
+                    if fired and not last_fired:
+                        onsets.append(i)
+                        if rebase_on_fire:
+                            ikssw.Update()
+                            fired = False  # post-rebase KS is small again
+                    last_fired = fired
                 try:
                     next_ep = next(ep_iter)
                 except StopIteration:
                     next_ep = -1
         out.append(FeatureFire(feature=d, onsets=onsets,
                                ks_seq=ks_seq[:write_idx],
-                               eval_seq=np.asarray(eval_seq_list, dtype=int)))
+                               eval_seq=np.asarray(eval_seq_list, dtype=int),
+                               crossings=crossings))
     return out
 
 
@@ -445,6 +486,50 @@ def rising_edges_at(feat: FeatureFire, ks_min: float) -> List[int]:
     return onsets
 
 
+def _quorum_onsets(feat_edges: List[List[int]], eval_seq: np.ndarray, *,
+                   k: int, persist: int, refractory: int,
+                   agg_win: int = AGG_WIN) -> List[int]:
+    """
+    Shared aggregator core: walks `eval_seq` once, emits onsets where
+    `>= k` distinct features have a rising edge inside [ep-agg_win, ep],
+    held for `persist` consecutive eval steps, with `refractory` cooldown
+    between emits.
+
+    Decoupled from how `feat_edges` was derived (ks_min filter,
+    confirm-window peak filter, ...), so the same kernel powers
+    `aggregate_onsets_v2` and `ksconfirm_sweep`.
+    """
+    n_feat = len(feat_edges)
+    if n_feat == 0:
+        return []
+    eval_list = eval_seq.tolist()
+    iters = [iter(es) for es in feat_edges]
+    pending = [next(it, None) for it in iters]
+    present: List[Deque[int]] = [deque() for _ in range(n_feat)]
+    onsets: List[int] = []
+    streak = 0
+    last_onset_seq = -10 ** 18
+    for ep in eval_list:
+        # evict edges that left the window
+        for q in present:
+            while q and q[0] < ep - agg_win:
+                q.popleft()
+        # admit edges that entered the window (<= ep)
+        for fi in range(n_feat):
+            while pending[fi] is not None and pending[fi] <= ep:
+                present[fi].append(pending[fi])
+                pending[fi] = next(iters[fi], None)
+        count = sum(1 for q in present if q)
+        if count >= k:
+            streak += 1
+        else:
+            streak = 0
+        if streak >= persist and ep >= last_onset_seq + refractory:
+            onsets.append(int(ep))
+            last_onset_seq = ep
+    return onsets
+
+
 def aggregate_onsets_v2(features: List[FeatureFire], eval_seq: np.ndarray, *,
                         k: int, ks_min: float, persist: int, refractory: int,
                         agg_win: int = AGG_WIN) -> List[int]:
@@ -459,36 +544,9 @@ def aggregate_onsets_v2(features: List[FeatureFire], eval_seq: np.ndarray, *,
     """
     if len(features) == 0:
         return []
-    # Per-feature rising-edge lists at this ks_min
     feat_edges: List[List[int]] = [rising_edges_at(f, ks_min) for f in features]
-    # Walk eval_seq once
-    eval_list = eval_seq.tolist()
-    # iterators / per-feature presence deque
-    iters = [iter(es) for es in feat_edges]
-    pending = [next(it, None) for it in iters]
-    present: List[Deque[int]] = [deque() for _ in features]
-    onsets: List[int] = []
-    streak = 0
-    last_onset_seq = -10 ** 18
-    for ep in eval_list:
-        # evict edges that left the window
-        for q in present:
-            while q and q[0] < ep - agg_win:
-                q.popleft()
-        # admit edges that entered the window (<= ep)
-        for fi in range(len(features)):
-            while pending[fi] is not None and pending[fi] <= ep:
-                present[fi].append(pending[fi])
-                pending[fi] = next(iters[fi], None)
-        count = sum(1 for q in present if q)
-        if count >= k:
-            streak += 1
-        else:
-            streak = 0
-        if streak >= persist and ep >= last_onset_seq + refractory:
-            onsets.append(int(ep))
-            last_onset_seq = ep
-    return onsets
+    return _quorum_onsets(feat_edges, eval_seq, k=k, persist=persist,
+                          refractory=refractory, agg_win=agg_win)
 
 
 @dataclass
@@ -559,6 +617,61 @@ def precision_sweep(features: List[FeatureFire],
                         "n_false_trigger": m.n_false_trigger,
                     })
     return rows
+
+
+# ---------------- ksConfirm sweep (确认窗口模式) ----------------
+# 网格 0.00–0.25 步长 0.01;0.00 = 无幅度门(确认窗口本身仍生效)。
+KSCONFIRM_GRID: Tuple[float, ...] = tuple(round(float(x), 3)
+                                          for x in np.arange(0.00, 0.26, 0.01))
+
+
+def ksconfirm_sweep(features: List[FeatureFire],
+                    drift_events: List[Tuple[int, int]], *,
+                    confirm_window: int,
+                    k_grid: Tuple[int, ...] = (2,),
+                    refractory_grid: Tuple[int, ...] = (W,)
+                    ) -> List[Dict[str, Any]]:
+    """
+    Sweep `ksConfirm` over the precomputed `crossings` (from per_feature_iks with
+    confirm_window>0). For each (k, refractory, ksConfirm), build feat_edges by
+    keeping only crossings whose confirm-window peak >= ksConfirm, then run the
+    shared quorum aggregator. Recall-preserving by construction: real drifts have
+    high peaks, noise crossings have low peaks (HANDOVER §1).
+
+    `persist=1` because the confirm-window peak gate already filters noise.
+    """
+    eg = shared_eval_grid(features)
+    rows: List[Dict[str, Any]] = []
+    for k in k_grid:
+        for refractory in refractory_grid:
+            for ksc in KSCONFIRM_GRID:
+                feat_edges = [sorted(cs for (cs, pk) in f.crossings if pk >= ksc)
+                              for f in features]
+                onsets = _quorum_onsets(feat_edges, eg, k=k, persist=1,
+                                        refractory=refractory, agg_win=AGG_WIN)
+                m = labeled_metrics(drift_events, onsets)
+                rows.append({
+                    "confirm_window": confirm_window, "k": k,
+                    "ksConfirm": ksc, "refractory": refractory,
+                    "recall": m.recall, "precision": m.precision,
+                    "median_latency": m.median_latency,
+                    "n_agg_onsets": len(onsets),
+                    "n_false_trigger": m.n_false_trigger,
+                })
+    return rows
+
+
+def pick_ksconfirm_recommendation(sweep_rows: List[Dict[str, Any]]
+                                  ) -> Optional[Dict[str, Any]]:
+    """
+    HANDOVER §5: among rows with `recall == 1.0`, choose smallest n_agg_onsets;
+    tie-break on largest ksConfirm. Returns None if no row reaches recall=1.0.
+    """
+    recall_full = [r for r in sweep_rows if r.get("recall") == 1.0]
+    if not recall_full:
+        return None
+    recall_full.sort(key=lambda r: (r["n_agg_onsets"], -r["ksConfirm"]))
+    return recall_full[0]
 
 
 def pick_operating_point(sweep_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -960,6 +1073,14 @@ def main():
                     help="list datasets the yml exposes and exit")
     ap.add_argument("--k-grid", default="1,2,3",
                     help="comma-separated initial k values to scan; 1 and D are always added")
+    ap.add_argument("--ksconfirm-sweep", action="store_true",
+                    help="run the confirm-window+ksConfirm sweep (HANDOVER §5);"
+                         " writes derisk_ksconfirm_sweep.csv with one row per"
+                         " (dataset, confirm_window, k, ksConfirm, refractory)")
+    ap.add_argument("--confirm-window", default="500",
+                    help="comma-separated C values for --ksconfirm-sweep (default 500)")
+    ap.add_argument("--ksconfirm-k", default="2",
+                    help="comma-separated k values for the ksconfirm sweep (default 2)")
     args = ap.parse_args()
 
     all_specs = all_dataset_specs()
@@ -981,6 +1102,49 @@ def main():
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     streams = {"summary": [], "ksweep": [], "labeled": [], "precision_sweep": []}
+    ksconfirm_rows: List[Dict[str, Any]] = []
+
+    if args.ksconfirm_sweep:
+        confirm_windows = [int(x) for x in args.confirm_window.split(",") if x.strip()]
+        ksc_k_grid = tuple(int(x) for x in args.ksconfirm_k.split(",") if x.strip())
+        print(f"\n[ksconfirm-sweep] confirm_windows={confirm_windows} k_grid={ksc_k_grid}")
+        for spec in specs:
+            if not spec.csv_path.exists() or not spec.drift_events:
+                print(f"  skip {spec.name}: no csv or no drift_events")
+                continue
+            print(f"=== ksconfirm-sweep {spec.name} ===")
+            X, _ = load_dataset(spec)
+            for C in confirm_windows:
+                print(f"  per_feature_iks confirm_window={C} (this is the slow step) ...")
+                feats = per_feature_iks(X, ca=CA, rebase_on_fire=REBASE_ON_FIRE,
+                                        eval_stride=max(1, GT_STEP // 4),
+                                        confirm_window=C)
+                rows = ksconfirm_sweep(feats, spec.drift_events,
+                                       confirm_window=C, k_grid=ksc_k_grid,
+                                       refractory_grid=(W,))
+                for r in rows:
+                    r["dataset"] = spec.name
+                ksconfirm_rows.extend(rows)
+                rec = pick_ksconfirm_recommendation(rows)
+                if rec is not None:
+                    print(f"  recommend C={C}: k={rec['k']} ksConfirm={rec['ksConfirm']} "
+                          f"n_agg_onsets={rec['n_agg_onsets']} (recall=1.0)")
+                else:
+                    print(f"  C={C}: no row with recall=1.0 — try larger C or smaller k")
+
+        ksconfirm_path = OUT_DIR / "derisk_ksconfirm_sweep.csv"
+        if ksconfirm_rows:
+            fields = ["dataset", "confirm_window", "k", "ksConfirm", "refractory",
+                      "recall", "precision", "median_latency",
+                      "n_agg_onsets", "n_false_trigger"]
+            if args.dataset:
+                existing = _read_existing_rows(ksconfirm_path)
+                existing = [r for r in existing if r.get("dataset") != args.dataset]
+                ksconfirm_rows = existing + ksconfirm_rows
+            _write_csv(ksconfirm_path, fields, ksconfirm_rows)
+            print(f"\n  -> {ksconfirm_path.relative_to(PROJECT_ROOT)}")
+        return
+
     for spec in specs:
         result = run_dataset(spec, list(k_grid_base))
         for k, rows in result.items():
