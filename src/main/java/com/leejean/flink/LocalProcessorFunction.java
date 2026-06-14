@@ -351,20 +351,28 @@ public class LocalProcessorFunction
             cooldownWrites.update(cWrites);
         }
 
-        // 双终止条件 / dual termination condition
-        // (1) 正常:ringBuffer 被新数据完全覆盖 AND 至少经过 cooldownSamples 条
-        // (2) 兜底:经过 cooldownSamples*2 条仍未写满 (legacy 路径下 z-score 过严时使用;
-        //         d1a 路径下 cWrites==cN,(1) 通常先成立)
-        boolean fillCondition = (cWrites >= ringBufferSize) && (cN >= cooldownSamples);
+        // 终止条件 / termination condition
+        // (1) 正常:ringBuffer 被新数据完全覆盖。
+        //     - legacy 路径: AND cN >= cooldownSamples (原余量,留给概念沉降)
+        //     - d1a 路径    : 直接以 ring.isFull() 为准 (A.4 优化)。D1a 无筛选
+        //                    下 cWrites == cN,ring 满即为最新 ringBufferSize 条
+        //                    post-drift 数据,沉降需求降低 → 把死区从 max(rbSz,
+        //                    cooldownSamples) 降到 rbSz,挂死窗口减半 + 降重训
+        //                    延迟。仍不能完全消除 EOF 挂死 (Fix B 兜底仍生效)。
+        // (2) 兜底:经过 cooldownSamples*2 条仍未写满 (legacy z-score 过严时使用)
+        boolean isD1a = COOLDOWN_POLICY_D1A.equals(cooldownPolicy);
+        boolean fillCondition = isD1a
+                ? (cWrites >= ringBufferSize)
+                : ((cWrites >= ringBufferSize) && (cN >= cooldownSamples));
         boolean fallbackCondition = (cN >= (long) cooldownSamples * 2L);
 
         if (fillCondition) {
-            LOG.info("subtask={}: COOLDOWN done normally, cN={}, writes={}",
-                    subtaskIndex, cN, cWrites);
+            LOG.info("subtask={}: COOLDOWN done normally (policy={}), cN={}, writes={}",
+                    subtaskIndex, cooldownPolicy, cN, cWrites);
             retrainAndEnterWaiting(ctx);
         } else if (fallbackCondition) {
-            LOG.warn("subtask={}: COOLDOWN forced training, cN={} writes={} (only {}/{} ringBuffer filled)",
-                    subtaskIndex, cN, cWrites, cWrites, ringBufferSize);
+            LOG.warn("subtask={}: COOLDOWN forced training (policy={}), cN={} writes={} (only {}/{} ringBuffer filled)",
+                    subtaskIndex, cooldownPolicy, cN, cWrites, cWrites, ringBufferSize);
             retrainAndEnterWaiting(ctx);
         }
     }

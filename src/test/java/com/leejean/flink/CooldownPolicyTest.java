@@ -26,7 +26,7 @@ public class CooldownPolicyTest {
 
     @Test
     public void testD1aPolicyDrivesRetrain() throws Exception {
-        runWith("d1a");
+        runWith("d1a", 200, 300, 2000);
         long expectedBatchId = ((long) 0 << 32) | 7L;
         int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
         assertTrue(n >= 2, "d1a path should drive retrain, got " + n);
@@ -34,22 +34,52 @@ public class CooldownPolicyTest {
 
     @Test
     public void testLegacyPolicyDrivesRetrain() throws Exception {
-        runWith("legacy");
+        runWith("legacy", 200, 300, 2000);
         long expectedBatchId = ((long) 0 << 32) | 7L;
         int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
         assertTrue(n >= 2, "legacy path should drive retrain, got " + n);
     }
 
-    private void runWith(String policy) throws Exception {
+    /**
+     * HANDOVER A.4:在 cooldownSamples 远大于 ringBufferSize 的极端配置下,
+     * d1a 路径应在 ring 填满时立即触发重训,不再受 cN >= cooldownSamples 的约束。
+     * 同样配置 (1500 条数据, cooldownSamples=10000) 在 legacy 路径下两条件都不到,
+     * 应不产 retrain trees,作为对比验证 A.4 的差异性确实落到代码上。
+     */
+    @Test
+    public void testD1aFillsAtRingBufferSize_PerA4() throws Exception {
+        // d1a:cN==cWrites,ring 在 cN=ringBufferSize=200 时即满 → A.4 触发
+        runWith("d1a", 200, 10000, 1500);
+        long expectedBatchId = ((long) 0 << 32) | 7L;
+        int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
+        assertTrue(n >= 2, "d1a + A.4 should trigger retrain at ring fill, got " + n);
+    }
+
+    @Test
+    public void testLegacyDoesNotFillUnderExtremeCooldownSamples() throws Exception {
+        // 同样配置 legacy 下应不触发 (cN 无法到 10000;fallback 在 cN>=20000 也不到)
+        runWith("legacy", 200, 10000, 1500);
+        long expectedBatchId = ((long) 0 << 32) | 7L;
+        int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
+        assertEquals(0, n,
+                "legacy under cooldownSamples=10000 with 1500 records must NOT retrain "
+                        + "(this is the EOF death-window A.4 narrows); got " + n);
+    }
+
+    private void runWith(String policy, int ringBufferSize, int cooldownSamples,
+                          int nRecords) throws Exception {
         int parallelism = 1;
         int maxP = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
+        final String pol = policy;
+        final int rbSz = ringBufferSize;
+        final int csz = cooldownSamples;
         ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
             put("subsampleSize", "32");
             put("totalTrees", "2");
-            put("ringBufferSize", "200");
-            put("cooldownSamples", "300");
+            put("ringBufferSize", String.valueOf(rbSz));
+            put("cooldownSamples", String.valueOf(csz));
             put("seed", "42");
-            put("cooldownPolicy", policy);
+            put("cooldownPolicy", pol);
         }});
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
@@ -59,7 +89,7 @@ public class CooldownPolicyTest {
 
         List<DataPoint> data = new ArrayList<>();
         Random rng = new Random(99);
-        for (int i = 0; i < 2000; i++) {
+        for (int i = 0; i < nRecords; i++) {
             double[] f = new double[9];
             for (int d = 0; d < 9; d++) f[d] = rng.nextGaussian() * 10 + 50;
             DataPoint dp = new DataPoint(String.valueOf(i), System.currentTimeMillis(), f, 0);
