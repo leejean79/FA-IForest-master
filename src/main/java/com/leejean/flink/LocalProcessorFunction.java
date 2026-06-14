@@ -106,6 +106,15 @@ public class LocalProcessorFunction
     private transient String cooldownPolicy;
     private static final String COOLDOWN_POLICY_LEGACY = "legacy";
     private static final String COOLDOWN_POLICY_D1A = "d1a";
+    // A.4 隔离开关:用于将「d1a 路径下 fillCondition 提前到 ring 满即止 (A.4)」
+    // 这一项,与 d1a 的其他改动 (清空 ring + 无条件入池) 分离评估。仅当
+    // cooldownPolicy=d1a 时生效;legacy 路径不受影响。
+    //   "ringfull"        (默认): cWrites >= ringBufferSize 即止 (A.4 开)
+    //   "cooldownsamples"        : 与 legacy 同条件,需 (cWrites >= ringBufferSize)
+    //                              AND (cN >= cooldownSamples) (A.4 关)
+    private transient String d1aFill;
+    private static final String D1A_FILL_RINGFULL = "ringfull";
+    private static final String D1A_FILL_COOLDOWNSAMPLES = "cooldownsamples";
     private transient PauseMode pauseMode;
 
 
@@ -176,12 +185,20 @@ public class LocalProcessorFunction
                     "Unknown cooldownPolicy: " + cooldownPolicy
                             + " (expected 'legacy' or 'd1a')");
         }
+        // A.4 隔离开关 (仅在 cooldownPolicy=d1a 下生效)
+        d1aFill = params.get("d1aFill", D1A_FILL_RINGFULL);
+        if (!D1A_FILL_RINGFULL.equals(d1aFill)
+                && !D1A_FILL_COOLDOWNSAMPLES.equals(d1aFill)) {
+            throw new IllegalArgumentException(
+                    "Unknown d1aFill: " + d1aFill
+                            + " (expected 'ringfull' or 'cooldownsamples')");
+        }
 
         String pauseModeStr = params.get("pauseMode", "USE_OLD_FOREST");
         pauseMode = PauseMode.valueOf(pauseModeStr);
 
-        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, cooldownTimeoutMs={}, pauseMode={}, cooldownPolicy={}",
-                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, cooldownTimeoutMs, pauseMode, cooldownPolicy);
+        LOG.info("subtask={}, subsampleSize={}, ringBufferSize={}, localTreeCount={}, totalTrees={}, cooldownSamples={}, cooldownTimeoutMs={}, pauseMode={}, cooldownPolicy={}, d1aFill={}",
+                subtaskIndex, subsampleSize, ringBufferSize, localTreeCount, totalTrees, cooldownSamples, cooldownTimeoutMs, pauseMode, cooldownPolicy, d1aFill);
 
     }
 
@@ -357,17 +374,18 @@ public class LocalProcessorFunction
 
         // 终止条件 / termination condition
         // (1) 正常:ringBuffer 被新数据完全覆盖。
-        //     - legacy 路径: AND cN >= cooldownSamples (原余量,留给概念沉降)
-        //     - d1a 路径    : 直接以 ring.isFull() 为准 (A.4 优化)。D1a 无筛选
-        //                    下 cWrites == cN,ring 满即为最新 ringBufferSize 条
-        //                    post-drift 数据,沉降需求降低 → 把死区从 max(rbSz,
-        //                    cooldownSamples) 降到 rbSz,挂死窗口减半 + 降重训
-        //                    延迟。仍不能完全消除 EOF 挂死 (Fix B 兜底仍生效)。
+        //     - legacy 路径                 : AND cN >= cooldownSamples (原余量,留给概念沉降)
+        //     - d1a + d1aFill=ringfull        (A.4 开,默认): ring 满 (cWrites>=rbSz) 即止
+        //     - d1a + d1aFill=cooldownsamples (A.4 关)      : 与 legacy 同条件
+        //   d1aFill 是 A.4 隔离开关:用于把「d1a 路径下 A.4 提前终止」与「d1a 池
+        //   构成本身 (清空+无条件入池)」分开评估。BACKLOG 下若 A.4 导致重训翻倍,
+        //   关掉 A.4 (d1aFill=cooldownsamples) 即可定位是否是 A.4 的副作用。
         // (2) 兜底:经过 cooldownSamples*2 条仍未写满 (legacy z-score 过严时使用)
         boolean isD1a = COOLDOWN_POLICY_D1A.equals(cooldownPolicy);
-        boolean fillCondition = isD1a
-                ? (cWrites >= ringBufferSize)
-                : ((cWrites >= ringBufferSize) && (cN >= cooldownSamples));
+        boolean d1aRingFull = isD1a && D1A_FILL_RINGFULL.equals(d1aFill);
+        boolean fillCondition = d1aRingFull
+                ? (cWrites >= ringBufferSize)                               // A.4:ring 满 (1000) 即止
+                : ((cWrites >= ringBufferSize) && (cN >= cooldownSamples)); // 需到 cooldownSamples (2000) 才止
         boolean fallbackCondition = (cN >= (long) cooldownSamples * 2L);
 
         if (fillCondition) {

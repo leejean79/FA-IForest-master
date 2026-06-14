@@ -48,11 +48,11 @@ public class CooldownPolicyTest {
      */
     @Test
     public void testD1aFillsAtRingBufferSize_PerA4() throws Exception {
-        // d1a:cN==cWrites,ring 在 cN=ringBufferSize=200 时即满 → A.4 触发
-        runWith("d1a", 200, 10000, 1500);
+        // d1a + d1aFill=ringfull:cN==cWrites,ring 在 cN=ringBufferSize=200 时即满 → A.4 触发
+        runWith("d1a", "ringfull", 200, 10000, 1500);
         long expectedBatchId = ((long) 0 << 32) | 7L;
         int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
-        assertTrue(n >= 2, "d1a + A.4 should trigger retrain at ring fill, got " + n);
+        assertTrue(n >= 2, "d1a + A.4 (ringfull) should trigger retrain at ring fill, got " + n);
     }
 
     @Test
@@ -66,11 +66,33 @@ public class CooldownPolicyTest {
                         + "(this is the EOF death-window A.4 narrows); got " + n);
     }
 
+    /**
+     * A.4 隔离开关验证:d1a + d1aFill=cooldownsamples 下 A.4 关闭,fillCondition
+     * 与 legacy 同条件 (需 cN >= cooldownSamples)。同样配置 (1500, cooldownSamples=10000)
+     * 应不产 retrain trees,与 testLegacyDoesNotFillUnderExtremeCooldownSamples 对齐。
+     * 用于把「A.4 提前终止」从「d1a 池构成本身」剥离,定位 BACKLOG 重训翻倍归因。
+     */
+    @Test
+    public void testD1aWithoutA4_PerSwitch() throws Exception {
+        runWith("d1a", "cooldownsamples", 200, 10000, 1500);
+        long expectedBatchId = ((long) 0 << 32) | 7L;
+        int n = (int) TREES.stream().filter(m -> m.getBatchId() == expectedBatchId).count();
+        assertEquals(0, n,
+                "d1a + d1aFill=cooldownsamples (A.4 off) must NOT retrain when cN<10000; got " + n);
+    }
+
     private void runWith(String policy, int ringBufferSize, int cooldownSamples,
                           int nRecords) throws Exception {
+        // 4 参数过载:沿用 d1aFill 的默认值 (ringfull),与 LocalProcessorFunction 一致
+        runWith(policy, "ringfull", ringBufferSize, cooldownSamples, nRecords);
+    }
+
+    private void runWith(String policy, String d1aFillValue, int ringBufferSize,
+                          int cooldownSamples, int nRecords) throws Exception {
         int parallelism = 1;
         int maxP = KeyGroupRangeAssignment.computeDefaultMaxParallelism(parallelism);
         final String pol = policy;
+        final String df = d1aFillValue;
         final int rbSz = ringBufferSize;
         final int csz = cooldownSamples;
         ParameterTool params = ParameterTool.fromMap(new HashMap<String, String>() {{
@@ -80,6 +102,7 @@ public class CooldownPolicyTest {
             put("cooldownSamples", String.valueOf(csz));
             put("seed", "42");
             put("cooldownPolicy", pol);
+            put("d1aFill", df);
         }});
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
