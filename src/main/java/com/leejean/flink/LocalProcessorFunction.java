@@ -163,9 +163,13 @@ public class LocalProcessorFunction
         cooldownSamples = params.getInt("cooldownSamples", 2000);
         zThresholdK = params.getDouble("zThresholdK", 1.0);
         cooldownTimeoutMs = params.getLong("cooldownTimeoutMs", 60_000L);
-        // D1a 对照开关:legacy = 旧 z-score 过滤路径 (默认,保持现状);
-        //             d1a    = 进 COOLDOWN 清空 ringBuffer + 无条件写入
-        cooldownPolicy = params.get("cooldownPolicy", COOLDOWN_POLICY_LEGACY);
+        // COOLDOWN 池构成策略:
+        //   d1a    (默认): 进 COOLDOWN 清空 ringBuffer + post-drift 数据无条件写入。
+        //                  集群三次重复实验确认提升重训质量 (insects_abrupt
+        //                  overall_auc 0.730 → 0.778),synth/gradual 无回归 → 定为默认。
+        //   legacy       : 旧 z-score 过滤路径,仅作消融用,经 --extra-param
+        //                  cooldownPolicy=legacy 显式启用。
+        cooldownPolicy = params.get("cooldownPolicy", COOLDOWN_POLICY_D1A);
         if (!COOLDOWN_POLICY_LEGACY.equals(cooldownPolicy)
                 && !COOLDOWN_POLICY_D1A.equals(cooldownPolicy)) {
             throw new IllegalArgumentException(
