@@ -109,9 +109,13 @@ public class LocalProcessorFunction
     // A.4 隔离开关:用于将「d1a 路径下 fillCondition 提前到 ring 满即止 (A.4)」
     // 这一项,与 d1a 的其他改动 (清空 ring + 无条件入池) 分离评估。仅当
     // cooldownPolicy=d1a 时生效;legacy 路径不受影响。
-    //   "ringfull"        (默认): cWrites >= ringBufferSize 即止 (A.4 开)
-    //   "cooldownsamples"        : 与 legacy 同条件,需 (cWrites >= ringBufferSize)
-    //                              AND (cN >= cooldownSamples) (A.4 关)
+    //   "cooldownsamples" (默认): 与 legacy 同条件,需 (cWrites >= ringBufferSize)
+    //                             AND (cN >= cooldownSamples) (A.4 关)。隔离实验
+    //                             确认 BACKLOG 上 overall_auc 0.760,优于 legacy
+    //                             0.726 与 ringfull 0.712,故定为默认。
+    //   "ringfull"              : cWrites >= ringBufferSize 即止 (A.4 开)。BACKLOG
+    //                             下经验上重训翻倍且 overall_auc 下降,保留作非默
+    //                             认选项,用于消融/无界流场景。
     private transient String d1aFill;
     private static final String D1A_FILL_RINGFULL = "ringfull";
     private static final String D1A_FILL_COOLDOWNSAMPLES = "cooldownsamples";
@@ -185,8 +189,9 @@ public class LocalProcessorFunction
                     "Unknown cooldownPolicy: " + cooldownPolicy
                             + " (expected 'legacy' or 'd1a')");
         }
-        // A.4 隔离开关 (仅在 cooldownPolicy=d1a 下生效)
-        d1aFill = params.get("d1aFill", D1A_FILL_RINGFULL);
+        // A.4 隔离开关 (仅在 cooldownPolicy=d1a 下生效);默认 cooldownsamples 以
+        // 关闭 A.4,经隔离实验确认是 BACKLOG 上最稳的取值。
+        d1aFill = params.get("d1aFill", D1A_FILL_COOLDOWNSAMPLES);
         if (!D1A_FILL_RINGFULL.equals(d1aFill)
                 && !D1A_FILL_COOLDOWNSAMPLES.equals(d1aFill)) {
             throw new IllegalArgumentException(
