@@ -13,7 +13,7 @@ import com.leejean.common_utils.ParallelismKeys;
 import com.leejean.common_utils.SequenceSource;
 import com.leejean.flink.FeatureSplitFlatMap;
 import com.leejean.flink.LocalProcessorFunction;
-import com.leejean.flink.PerFeatureIKSFunction;
+import com.leejean.flink.PerFeatureHDDMFunction;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.MapFunction;
@@ -44,7 +44,7 @@ import java.util.UUID;
  * <ul>
  *   <li>打分面（行并行，沿用）：keyBy(uniform key) → LocalProcessorFunction → output-scores</li>
  *   <li>检测面（列并行，新增）：flatMap(FeatureSplit) → keyBy(featureId)
- *       → PerFeatureIKSFunction → feature-drift-topic</li>
+ *       → PerFeatureHDDMFunction → feature-drift-topic</li>
  * </ul>
  * 打分面广播路径不变，聚合器经 drift-round-topic 推 COMMITTED 进
  * {@link LocalProcessorFunction}，驱动 STABLE → COOLDOWN → WAITING → STABLE。
@@ -55,7 +55,8 @@ import java.util.UUID;
  *   --featureDriftTopic feature-drift-topic --driftRoundTopic drift-round-topic
  *   --hasHeader true --hasId true --hasLabel true --autoIncrementId true
  *   --totalTrees 100 --subsampleSize 256 --ringBufferSize 1000 --parallelism 4
- *   --iksWindowSize 2000 --iksPValue 0.001 --confirmWin 2000 --ksConfirm 0.05
+ *   --hddmWarmup 2000 --hddmLambda 0.1 --hddmWarnConf 0.005 --hddmDriftConf 0.001
+ *   --hddmWarnTimeout 2000 --hddmScaleMode maxdev
  *   --cooldownSamples 5000 --zThresholdK 1.0
  */
 public class LocalProcessor {
@@ -79,12 +80,16 @@ public class LocalProcessor {
         String driftRoundTopic = params.get("driftRoundTopic", "drift-round-topic");
 
         // 检测面参数 / detection-side parameters
-        int iksWindowSize = params.getInt("iksWindowSize", 2000);
-        double iksPValue = params.getDouble("iksPValue", 0.001);
-        int confirmWin = params.getInt("confirmWin", iksWindowSize);
-        // 默认保守：ksConfirm ≈ thr，幅度门不伤 recall，靠 confirmWin 滤瞬态
-        double defaultThr = Math.sqrt(-0.5 * Math.log(iksPValue)) * Math.sqrt(2.0 / iksWindowSize);
-        double ksConfirm = params.getDouble("ksConfirm", defaultThr);
+        int iksWindowSize = params.getInt("iksWindowSize", 2000);   // 复用为 HDDM warm-up 默认值
+
+        // HDDM_W 检测面参数 / HDDM_W detection-side parameters
+        int    hddmWarmup      = params.getInt("hddmWarmup", iksWindowSize);   // 复用 W=2000
+        double hddmLambda      = params.getDouble("hddmLambda", 0.1);
+        double hddmWarnConf    = params.getDouble("hddmWarnConf", 0.005);
+        double hddmDriftConf   = params.getDouble("hddmDriftConf", 0.001);
+        long   hddmWarnTimeout = params.getLong("hddmWarnTimeout", 2000L);
+        String hddmScaleMode   = params.get("hddmScaleMode", "maxdev");
+
         // 检测面并行度（Fork 1 v1：1；Fork 2 EXP3：P_d）
         int detectionParallelism = params.getInt("detectionParallelism", 1);
 
@@ -113,11 +118,12 @@ public class LocalProcessor {
         System.out.println("Subsample size: " + subsampleSize);
         System.out.println("Ring buffer size: " + ringBufferSize);
         System.out.println("Local tree count per subtask: " + localTreeCount);
-        System.out.println("--- detection side ---");
-        System.out.println("IKS window size W: " + iksWindowSize);
-        System.out.println("IKS pValue: " + iksPValue);
-        System.out.println("Confirm window C: " + confirmWin);
-        System.out.println("ksConfirm: " + ksConfirm + " (default thr=" + defaultThr + ")");
+        System.out.println("--- detection side (HDDM_W) ---");
+        System.out.println("HDDM warmup W: " + hddmWarmup);
+        System.out.println("HDDM lambda: " + hddmLambda);
+        System.out.println("HDDM warnConf/driftConf: " + hddmWarnConf + " / " + hddmDriftConf);
+        System.out.println("HDDM warnTimeout: " + hddmWarnTimeout);
+        System.out.println("HDDM scaleMode: " + hddmScaleMode);
         System.out.println("Detection parallelism P_d: " + detectionParallelism);
         System.out.println("--- scoring side / COOLDOWN ---");
         System.out.println("Cooldown samples: " + cooldownSamples);
@@ -170,9 +176,10 @@ public class LocalProcessor {
 
         DataStream<FeatureDrift> featureDriftStream = featureStream
                 .keyBy((KeySelector<FeatureValue, Integer>) FeatureValue::getFeatureId)
-                .process(new PerFeatureIKSFunction(iksWindowSize, iksPValue, confirmWin, ksConfirm))
+                .process(new PerFeatureHDDMFunction(hddmWarmup, hddmLambda,
+                        hddmWarnConf, hddmDriftConf, hddmWarnTimeout, hddmScaleMode))
                 .setParallelism(detectionParallelism)
-                .name("Per-Feature IKS (peak-KS gate)");
+                .name("Per-Feature HDDM_W");
 
         Properties producerProps = new Properties();
         producerProps.setProperty("bootstrap.servers", brokers);
@@ -267,7 +274,7 @@ public class LocalProcessor {
         processed.print("ScoreResult");
         featureDriftStream.print("FeatureDrift emitted");
 
-        env.execute("LocalProcessor - Per-Feature IKS Detection + Aggregator-Driven Retrain (phase3)");
+        env.execute("LocalProcessor - Per-Feature HDDM_W Detection + Aggregator-Driven Retrain (phase3)");
     }
 
     // ===== 序列化/反序列化工具类 =====
