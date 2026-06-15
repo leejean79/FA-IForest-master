@@ -55,8 +55,8 @@ import java.util.UUID;
  *   --featureDriftTopic feature-drift-topic --driftRoundTopic drift-round-topic
  *   --hasHeader true --hasId true --hasLabel true --autoIncrementId true
  *   --totalTrees 100 --subsampleSize 256 --ringBufferSize 1000 --parallelism 4
- *   --hddmWarmup 2000 --hddmLambda 0.1 --hddmWarnConf 0.005 --hddmDriftConf 0.001
- *   --hddmWarnTimeout 2000 --hddmScaleMode maxdev
+ *   --hddmWarmup 2000 --hddmLambda 0.005 --hddmWarnConf 0.005 --hddmDriftConf 0.001
+ *   --hddmWarnTimeout 2000 --hddmScaleMode p99
  *   --cooldownSamples 5000 --zThresholdK 1.0
  */
 public class LocalProcessor {
@@ -84,11 +84,11 @@ public class LocalProcessor {
 
         // HDDM_W 检测面参数 / HDDM_W detection-side parameters
         int    hddmWarmup      = params.getInt("hddmWarmup", iksWindowSize);   // 复用 W=2000
-        double hddmLambda      = params.getDouble("hddmLambda", 0.1);
+        double hddmLambda      = params.getDouble("hddmLambda", 0.005);   // 离线验证修正（原 0.1），见 devspec §4/§7
         double hddmWarnConf    = params.getDouble("hddmWarnConf", 0.005);
         double hddmDriftConf   = params.getDouble("hddmDriftConf", 0.001);
         long   hddmWarnTimeout = params.getLong("hddmWarnTimeout", 2000L);
-        String hddmScaleMode   = params.get("hddmScaleMode", "maxdev");
+        String hddmScaleMode   = params.get("hddmScaleMode", "p99");      // 离线验证修正（原 maxdev），见 devspec §3
 
         // 检测面并行度（Fork 1 v1：1；Fork 2 EXP3：P_d）
         int detectionParallelism = params.getInt("detectionParallelism", 1);
