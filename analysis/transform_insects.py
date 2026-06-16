@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 """
 INSECTS 异常转换 / INSECTS anomaly transformation
 

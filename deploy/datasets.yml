@@ -177,3 +177,17 @@ datasets:
     drift_type: gradual
     drift_spec: data/insects/INSECTS_gradual_imbalanced_transformed.driftspec.json
     drift_events: [32096]   # transformed_line
+
+  insects_reoccurring_imbalanced:
+    path: data/insects/INSECTS_incremental-reoccurring_imbalanced_transformed.csv
+    hasHeader: true
+    hasId: true
+    hasLabel: true
+    labelPosition: last
+    anomalyLabel: "1"
+    n_samples: 273402                        # 转换实测
+    dimensions: 33
+    notes: "INSECTS incremental-reoccurring. normal={12,2}, anomaly={5}. anomaly 4.876% (13331/273402). 双漂移点为概念切换/切回。"
+    drift_type: reoccurring
+    drift_spec: data/insects/INSECTS_incremental-reoccurring_imbalanced_transformed.driftspec.json
+    drift_events: [91134, 182273]   # transformed_line; 原始 150683/301365
