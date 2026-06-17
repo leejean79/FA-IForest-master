@@ -1,50 +1,97 @@
 # ============================================================================
-# experiment-configs.yml - 实验配置矩阵 (方向二(a) Phase 3)
-# 检测面 = per-feature IKS + 峰值-KS 确认 + 聚合器 → COMMITTED;打分面只剩
-# STABLE → COOLDOWN → WAITING → STABLE。WARN / 投票 / HDDM 置信度 维度全废。
-# 详见 HANDOVER_direction2a_phase3_arch.md。
+# experiment-configs.yml - 最终实验配置矩阵(两检测器收口版)
+# 检测面 = per-feature 检测器(IKS 或 HDDM_W,分支级并存)+ 聚合器 → COMMITTED;
+# 打分面 = STABLE → COOLDOWN → WAITING → STABLE(D1a 重训,默认 cooldownPolicy=d1a /
+# d1aFill=cooldownsamples)。
+#
+# 检测器并存方式:分支级。
+#   - per-feature IKS     → 分支 feature/per-feature-iks
+#   - per-feature HDDM_W  → 分支 feature/per-feature-hddm_w(PerFeatureHDDMFunction)
+# 同一套 plan 在两个分支上分别跑,结果合并对比。本 yml 的 plan_extras 中,IKS 专属参数
+# (iksWindowSize/iksPValue)与 HDDM_W 专属参数(hddmLambda/hddmScaleMode 等)按所在分支
+# 取用——在 IKS 分支跑时 HDDM 参数被静默忽略,反之亦然。
+#
+# 数据集主线:INSECTS_abrupt_imbalanced + INSECTS_gradual_imbalanced(真实、难度可比、
+# 归一化与特征健康度均已离线验证)。synth_* 仅作定性示意,不进定量主表(8σ 强度会系统
+# 性高估,详见 dataset_suitability_probe.md)。INSECTS incremental / incremental-
+# reoccurring 因 per-feature 架构不适配(全程渐变无离散点 / 来回切换信号过弱)排除,
+# 作架构边界讨论。
 # ============================================================================
 
-# ---------- 配置矩阵 (收缩到一个维度) ----------
+# ---------- 配置矩阵 ----------
 # pauseMode (PauseMode.java) —— COOLDOWN/WAITING 期打分行为:
 #   USE_OLD_FOREST           继续用旧森林打分输出
-#   BACKLOG_THEN_NEW_FOREST  数据进 backlog,等新森林到来后批量打分
-# 原 C1-C4 的 warnTimeoutBehavior 维度已废 (无 WARN 子状态了)。
+#   BACKLOG_THEN_NEW_FOREST  数据进 backlog,等新森林到来后批量打分(生产意图,主指标取此)
 configs:
   USE_OLD_FOREST:
     pauseMode: USE_OLD_FOREST
   BACKLOG_THEN_NEW_FOREST:
     pauseMode: BACKLOG_THEN_NEW_FOREST
 
-# ---------- 算法 (EXP4 可选) ----------
-# 主路径固定 per-feature IKS,不走 algorithms 段;EXP4 才用它切到 per-feature HDDM。
-# 旧的 score 域 HDDM_A* / HDDM_W 不再驱动主实验,仅留作 EXP4 对照备用。
-algorithms:
-  # 默认主路径:per-feature IKS (无需在此显式注册)
-  # EXP4: per-feature HDDM 备用,等 PerFeatureHDDMFunction 实现后开放
-  # HDDM_A:
-  #   detector: HDDM_A_Windowed
-  # HDDM_W:
-  #   detector: HDDM_W
-
 # ---------- 实验计划 ----------
+# 执行顺序(总策略:λ 扫描 → EXP1 选胜者 → EXP2/3 → EXP4 汇总):
+#   0. smoke_batch         批量调度验证
+#   1. lambda_sweep        【HDDM_W 分支专属,EXP1 前置】每数据集扫最优 λ*
+#   2. exp1_hddm_w         HDDM_W 分支,用各数据集 λ* 跑核心网格
+#   3. exp1_iks            IKS 分支,跑同一核心网格
+#      → 比较 exp1_hddm_w 与 exp1_iks 的 overall_auc,胜者为主检测器
+#   4. exp2                主检测器,stationary 误触发基线(多样数据集)
+#   5. exp3                主检测器,扩展性(多样数据集)
+#   6. EXP4                无需重跑:直接用 exp1_hddm_w + exp1_iks 的结果交叉分析
 plans:
-  # smoke_batch: 批量调度验证 (synth_abrupt × 2 pauseMode × 1 = 2)
-  # 用途: 验证 run-batch.sh 串行调度 + 实验间 topic 清理 + 断点续跑
+
+  # ---- 0. 冒烟:批量调度验证(synth_abrupt × 2 pauseMode × 1 = 2) ----
+  # 仅验证 run-batch.sh 串行调度 + 实验间 topic 清理 + 断点续跑;synth_abrupt 在此
+  # 只作机制冒烟,不产定量结论。
   smoke_batch:
     datasets: [synth_abrupt]
     configs: [USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST]
     repeats: 1
 
-  # EXP1 (核心): 新臂 across P — 端到端闭环 + 消稀释 (P-不变) + AUC 恢复 + 真实重训频率。
-  # 网格 = datasets × P∈{1,2,4} × pauseMode × repeats[3]
-  # 三观测项 (恢复曲线 / v1-v2 森林对比 / 重训频率) 离线从 scores.jsonl + model-topic.jsonl
-  # 重建,见 HANDOVER 附录 B。
-  # 旧臂 (score 行并行) 不在本 plan;若需对比,切到 Phase 3 前的 build 跑同网格,
-  # 或直接引用 finding 1 已记录的稀释数 (INSECTS abrupt:p=1→342 WARN, p=4→0)。
-  exp1:
+  # ---- 1. λ 扫描(HDDM_W 分支专属,EXP1 前置)----
+  # 目的:为 HDDM_W 在每个数据集上定最优 λ*,避免 EXP1 用未调好的 λ 与 IKS 比较
+  # 而引入"参数没调好"混淆。每数据集各取最优 λ(abrupt/gradual 最优 λ 可能不同,
+  # 这一差异本身是发现:HDDM_W 最优 λ 依赖漂移形态)。
+  # 规模 = 2 datasets × 3 λ × 1 pauseMode(BACKLOG)× 3 repeats = 18
+  # 只在 BACKLOG 下扫(生产意图模式,主指标口径);P 固定为 4(EXP1 主对比并行度)。
+  # 仅在 feature/per-feature-hddm_w 分支运行。
+  lambda_sweep:
     datasets:
-      - synth_abrupt
+      - insects_abrupt_imbalanced
+      - insects_gradual_imbalanced
+    configs: [BACKLOG_THEN_NEW_FOREST]
+    parallelism_grid: [4]
+    repeats: 3
+    plan_extras:
+      hddmScaleMode: p99
+      aggK: 2
+    grids:
+      hddmLambda: [0.002, 0.005, 0.01]
+
+  # ---- 2. EXP1 — HDDM_W 臂(在 feature/per-feature-hddm_w 分支跑)----
+  # 用 lambda_sweep 选出的各数据集 λ* 填入。注意:两个数据集若 λ* 不同,需拆成两次
+  # 运行(每次单数据集 + 对应 λ),或在 run-batch 支持 per-dataset extra 时一次跑完。
+  # 规模 = 2 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats = 36
+  exp1_hddm_w:
+    datasets:
+      - insects_abrupt_imbalanced
+      - insects_gradual_imbalanced
+    configs: [USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST]
+    parallelism_grid: [1, 2, 4]
+    repeats: 3
+    plan_extras:
+      hddmScaleMode: p99
+      aggK: 2
+      # hddmLambda 由 lambda_sweep 结果填入(每数据集各自 λ*);
+      # 若 abrupt/gradual 的 λ* 不同,见上方注释拆分运行。
+      hddmLambda: 0.005   # 占位默认,跑前据 lambda_sweep 替换
+
+  # ---- 3. EXP1 — IKS 臂(在 feature/per-feature-iks 分支跑)----
+  # 与 HDDM_W 臂同网格、同配置,仅检测器不同(分支不同)。这是 EXP1 单变量对比的
+  # IKS 基线。已知 insects_abrupt × p4 × BACKLOG overall_auc 中位 0.760。
+  # 规模 = 2 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats = 36
+  exp1_iks:
+    datasets:
       - insects_abrupt_imbalanced
       - insects_gradual_imbalanced
     configs: [USE_OLD_FOREST, BACKLOG_THEN_NEW_FOREST]
@@ -53,44 +100,74 @@ plans:
     plan_extras:
       iksWindowSize: 2000
       iksPValue: 0.001
-      # Route C (aggK=3) 经集群验证否决 —— insects_abrupt 上 n_committed 未下降、
-      # overall_auc 反而由 0.736 降到 0.688,故沿用 aggK=2;代码默认值
-      # (CoordinatorJob aggK=2) 无需改动,此处显式写出保留参数透传链路的可见性。
       aggK: 2
 
-  # EXP2: stationary 误触发率 (5 数据集 × 30 shuffle = 150)
-  # per-feature 在无漂移流上应几乎不 fire = 精度基线;config 取 USE_OLD_FOREST 即可。
+  # ---- 4. EXP2 — stationary 误触发率基线(主检测器,多样数据集)----
+  # per-feature 在无漂移流上应几乎不 fire = 精度基线。保留多样数据集(非 INSECTS),
+  # 因为误触发基线需要分布多样性,与"INSECTS 为主"不冲突。用 EXP1 选出的主检测器
+  # 所在分支跑。规模 = 5 datasets × 30 shuffle = 150。
   exp2:
     datasets: [donors, http, forestcover, fraud, mulcross]
     configs: [USE_OLD_FOREST]
     repeats: 30
     shuffle: true
+    plan_extras:
+      aggK: 2
+      # 检测器参数按主检测器所在分支填(IKS: iksWindowSize/iksPValue;
+      # HDDM_W: hddmLambda/hddmScaleMode)。
 
-  # EXP3: 扩展性 + Fork 2 (source partition=P) — 2 数据集 × 4 P × 3 repeat = 24
-  # 升 Fork 2 时改 .env 的 SOURCE_PARTITIONS=P_d (脚本默认 Fork 1 = 1)。
+  # ---- 5. EXP3 — 扩展性 + Fork 2(主检测器,多样数据集)----
+  # 升 Fork 2 时改 .env 的 SOURCE_PARTITIONS=P_d。保留 donors/http(大流、适合压扩展性)。
+  # 规模 = 2 datasets × P∈{1,2,4,6} × 3 repeats = 24。
   exp3:
     datasets: [donors, http]
     configs: [BACKLOG_THEN_NEW_FOREST]
     parallelism_grid: [1, 2, 4, 6]
     repeats: 3
+    plan_extras:
+      aggK: 2
 
-  # EXP4 (可选): per-feature IKS vs per-feature HDDM,等 PerFeatureHDDMFunction 落地再开。
-  exp4:
-    datasets: [synth_abrupt, insects_abrupt_imbalanced]
-    configs: [BACKLOG_THEN_NEW_FOREST]
-    repeats: 3
-    enabled: false
+  # ---- 6. EXP4 — 检测器–漂移形态匹配律 ----
+  # 不单独跑:直接取 exp1_hddm_w 与 exp1_iks 在 INSECTS_abrupt / INSECTS_gradual 上的
+  # overall_auc 交叉分析(2 检测器 × 2 形态),配合离线 ε 下界分析(devspec §7)。
+  # synth 形态示意从离线 hddm_signal_batch.py 的定性区取,不进集群。
+  # 故此 plan 为分析口径标记,无新增集群运行。
 
-  # Sensitivity: 参数敏感性 (单数据集, OAT 扫 4 个参数)
-  # 旧的 hddmWindowSize 改为 iksWindowSize;新增 aggK / ksConfirm 两个检测面维度;
-  # ringBufferSize / cooldownSamples 保留 (打分面 COOLDOWN 仍有)。
-  sensitivity:
-    dataset: synth_abrupt
+  # ---- 7. IKS 参数敏感性(OAT,IKS 分支)----
+  # 论文 IKS 检测器的参数稳健性附录。单数据集、单 pauseMode,OAT(one-at-a-time)
+  # 逐参数扫,其余取默认。ksConfirm 已废(默认关闭、离线标定失败),不扫。
+  # 在 feature/per-feature-iks 分支运行。
+  # 规模 = (3 iksWindowSize + 3 ringBufferSize + 3 cooldownSamples − 2 重复基线点)× 3 repeats
+  #       ≈ 7 个独立点 × 3 = 21(aggK 已在 EXP1 注释中由集群验证否决 aggK=3,此处可选扫)
+  sensitivity_iks:
+    dataset: insects_abrupt_imbalanced
     config: BACKLOG_THEN_NEW_FOREST
+    repeats: 3
+    plan_extras:
+      iksWindowSize: 2000
+      iksPValue: 0.001
+      aggK: 2
     grids:
       iksWindowSize: [1000, 2000, 4000]
-      aggK: [1, 2, 3]
-      ksConfirm: [0.04, 0.05, 0.08, 0.12]
-      ringBufferSize: [256, 512, 1000, 2000]
+      ringBufferSize: [512, 1000, 2000]
       cooldownSamples: [1000, 2000, 5000]
+
+  # ---- 8. HDDM_W 参数敏感性(OAT,HDDM_W 分支)----
+  # 与 IKS sensitivity 对称,供论文并列呈现两检测器的参数稳健性。
+  # λ 已在 lambda_sweep 充分扫描,此处补 scaleMode 与 warmup 两个 HDDM_W 专属维度。
+  # 在 feature/per-feature-hddm_w 分支运行。规模 ≈ 5 个独立点 × 3 = 15。
+  sensitivity_hddm_w:
+    dataset: insects_abrupt_imbalanced
+    config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
+    plan_extras:
+      hddmLambda: 0.005     # 用 lambda_sweep 选出的 abrupt λ* 替换
+      hddmScaleMode: p99
+      aggK: 2
+    grids:
+      hddmScaleMode: [p99, maxdev]
+      hddmWarmup: [1000, 2000, 4000]
+
+# ---------- λ 扫描结果回填区(lambda_sweep 跑完手动填)----------
+# insects_abrupt_imbalanced:  λ* = ____  (overall_auc ____)
+# insects_gradual_imbalanced: λ* = ____  (overall_auc ____)
