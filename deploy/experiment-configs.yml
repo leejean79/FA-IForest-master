@@ -166,8 +166,7 @@ plans:
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     plan_extras:
-      iksWindowSize: 2000
-      iksPValue: 0.001
+      iksPValue: 0.001     # 固定;iksWindowSize 不在此(在 grids 扫,避免被 plan_extras 覆盖)
       aggK: 2
     grids:
       iksWindowSize: [1000, 2000, 4000]
@@ -184,9 +183,8 @@ plans:
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     plan_extras:
-      hddmLambda: 0.005     # 用 lambda_sweep_abrupt 选出的 abrupt λ* 替换
-      hddmScaleMode: p99
-      aggK: 2
+      hddmLambda: 0.005     # 用 lambda_sweep_abrupt 选出的 abrupt λ* 替换;固定
+      aggK: 2               # hddmScaleMode 不在此(在 grids 扫,避免被 plan_extras 覆盖)
     grids:
       hddmScaleMode: [p99, maxdev]
       hddmWarmup: [1000, 2000, 4000]

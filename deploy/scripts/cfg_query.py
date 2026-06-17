@@ -140,13 +140,20 @@ def expand_sensitivity(plan):
     grids = plan["grids"]
     # 检测器算法标签 (配置级 --detector): 取 plan 的 algorithms 首项, 缺省 "_" (默认 IKS)
     algo = (plan.get("algorithms") or ["_"])[0]
+    # plan_extras 固定参数, 拼进每行 (随扫描参数一起传递, 保证可追溯且不依赖代码兜底默认)。
+    # 约定: plan_extras 不得含 grids 里正在扫描的参数, 否则 plan_extras 在后会覆盖扫描值。
+    extras = plan.get("plan_extras", {}) or {}
+    extras_str = ";".join(f"{k}={v}" for k, v in extras.items())
     lines = []
-    # 每个参数独立扫描 (one-at-a-time), 其他参数用默认
+    # 每个参数独立扫描 (one-at-a-time), 其余参数取 plan_extras 固定值
     for param, values in grids.items():
         for v in values:
             for r in range(1, repeats + 1):
-                # 格式: dataset config algo _ run param=value
-                lines.append(f"{ds} {cfg} {algo} _ {r} {param}={v}")
+                # 格式: dataset config algo _ run param=value[;extra...]
+                pairs = f"{param}={v}"
+                if extras_str:
+                    pairs = f"{pairs};{extras_str}"
+                lines.append(f"{ds} {cfg} {algo} _ {r} {pairs}")
     return lines
 
 def expand_configurations(plan):
