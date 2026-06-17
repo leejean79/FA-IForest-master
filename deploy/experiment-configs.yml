@@ -166,9 +166,11 @@ plans:
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     plan_extras:
-      iksWindowSize: 2000
       iksPValue: 0.001
       aggK: 2
+      # 注意:iksWindowSize 不在此(它在 grids 里扫)。若放进 plan_extras 会与 grids 重复,
+      # expand_sensitivity 拼接后 run-experiment 通用翻译时后者覆盖前者,导致 iksWindowSize
+      # 恒为 2000、OAT 扫不到 1000/4000(静默失效)。扫其它维时 iksWindowSize 取代码默认 2000,与意图一致。
     grids:
       iksWindowSize: [1000, 2000, 4000]
       ringBufferSize: [512, 1000, 2000]
