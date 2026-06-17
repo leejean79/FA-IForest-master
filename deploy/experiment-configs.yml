@@ -18,6 +18,14 @@
 # 作架构边界讨论。
 # ============================================================================
 
+# ---------- 算法注册(--algorithm → --detector 映射)----------
+# run-experiment.sh 第 60 行用 `cfg_query algorithm <id> detector` 查此段,
+# 得到的值经 --detector 传给 LocalProcessor(LocalProcessor 默认 iks,匹配 hddm_w)。
+# plan 内的 `algorithms: [HDDM_W]` 即引用此处的 key。
+algorithms:
+  HDDM_W:
+    detector: HDDM_W
+
 # ---------- 配置矩阵 ----------
 # pauseMode (PauseMode.java) —— COOLDOWN/WAITING 期打分行为:
 #   USE_OLD_FOREST           继续用旧森林打分输出
