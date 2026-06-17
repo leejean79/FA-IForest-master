@@ -27,8 +27,8 @@ package com.leejean.drift;
 public class HDDM_W implements DriftDetector {
     private static final long serialVersionUID = 1L;
 
-    private final HDDM_AConfig config;
-    private final double lambda;
+    private HDDM_AConfig config;
+    private double lambda;
 
     // EWMA 递推标量（取代滑动窗口）/ EWMA recursion scalar (replaces sliding window)
     private double ewma;
@@ -42,10 +42,12 @@ public class HDDM_W implements DriftDetector {
     // WARN 进入时的样本计数（0 表示未进入 WARN）/ sample count when WARN was entered
     private long warnEnteredAt;
 
-    /** Flink Kryo 序列化需要无参构造 / No-arg constructor for Flink Kryo serialization. */
-    private HDDM_W() {
-        this.config = null;
-        this.lambda = 0.0;
+    /**
+     * Flink PojoSerializer 需要 public 无参构造 / public no-arg ctor for Flink POJO serialization.
+     * 配合下方全字段 getter/setter，使 HDDM_W 成为合法 Flink POJO，checkpoint 走 PojoSerializer
+     * 而非 Kryo GenericType（避免无限重启策略下从 Kryo 快照恢复时状态错乱）。
+     */
+    public HDDM_W() {
     }
 
     public HDDM_W(HDDM_AConfig config, double lambda) {
@@ -128,6 +130,27 @@ public class HDDM_W implements DriftDetector {
         return n;
     }
 
+    // ===== Flink POJO 字段访问器 / accessors for Flink PojoSerializer =====
+    // 这些 getter/setter 仅供 Flink 反射访问字段以序列化/恢复 keyed state；
+    // 业务逻辑应只经 update()/reset() 改状态，勿手动 setter 绕过状态机。
     public HDDM_AConfig getConfig() { return config; }
+    public void setConfig(HDDM_AConfig config) { this.config = config; }
+
     public double getLambda() { return lambda; }
+    public void setLambda(double lambda) { this.lambda = lambda; }
+
+    public double getEwma() { return ewma; }
+    public void setEwma(double ewma) { this.ewma = ewma; }
+
+    public double getBestMean() { return bestMean; }
+    public void setBestMean(double bestMean) { this.bestMean = bestMean; }
+
+    public double getBestBound() { return bestBound; }
+    public void setBestBound(double bestBound) { this.bestBound = bestBound; }
+
+    public long getN() { return n; }
+    public void setN(long n) { this.n = n; }
+
+    public long getWarnEnteredAt() { return warnEnteredAt; }
+    public void setWarnEnteredAt(long warnEnteredAt) { this.warnEnteredAt = warnEnteredAt; }
 }

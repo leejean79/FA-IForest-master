@@ -1,10 +1,31 @@
 package com.leejean.drift;
 
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.typeutils.PojoTypeInfo;
+import org.apache.flink.api.java.typeutils.TypeExtractor;
 import org.junit.jupiter.api.Test;
 import java.util.Random;
 import static org.junit.jupiter.api.Assertions.*;
 
 class HDDM_WTest {
+
+    /**
+     * checkpoint 下 ValueState&lt;HDDM_W&gt; 必须走 PojoSerializer 而非 Kryo GenericType，
+     * 否则无限重启策略下从 Kryo 快照恢复可能导致 EWMA 状态错乱（DEV_FIXES 待修 1）。
+     * 本测试用 Flink 的 TypeExtractor（与构建 ValueStateDescriptor 序列化器同一路径）
+     * 断言 HDDM_W 与 HDDM_AConfig 均被识别为合法 POJO；若有人重新给字段加 final 或
+     * 去掉 getter/setter，本测试会失败。
+     */
+    @Test
+    void hddmWAndConfigAreFlinkPojoNotGenericType() {
+        TypeInformation<HDDM_W> ti = TypeExtractor.createTypeInfo(HDDM_W.class);
+        assertTrue(ti instanceof PojoTypeInfo,
+                "HDDM_W must be a Flink POJO (PojoTypeInfo), got " + ti.getClass().getSimpleName());
+
+        TypeInformation<HDDM_AConfig> cfgTi = TypeExtractor.createTypeInfo(HDDM_AConfig.class);
+        assertTrue(cfgTi instanceof PojoTypeInfo,
+                "HDDM_AConfig must be a Flink POJO (PojoTypeInfo), got " + cfgTi.getClass().getSimpleName());
+    }
 
     private static HDDM_AConfig defaultCfg() {
         return new HDDM_AConfig(0.005, 0.001, 10000L);
