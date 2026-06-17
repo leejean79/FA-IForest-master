@@ -32,7 +32,7 @@ configs:
 # 检测器经配置级 --detector 选择:run-experiment.sh 见到 --algorithm <名> 后查
 # algorithms.<名>.detector,透传 --detector <值> 给 LocalProcessor。IKS 为默认路径,
 # 不需注册(plan 的 algo 取 "_" → 不传 --detector → LocalProcessor 默认 iks)。
-# HDDM_W 相关 plan(lambda_sweep / exp1_hddm_w / sensitivity_hddm_w)带 algorithms:[HDDM_W],
+# HDDM_W 相关 plan(lambda_sweep_abrupt/gradual / exp1_hddm_w / sensitivity_hddm_w)带 algorithms:[HDDM_W],
 # 使其在 feature/per-feature-hddm_w 分支上确实以 HDDM_W(而非默认 IKS)运行。
 algorithms:
   HDDM_W:
@@ -41,7 +41,7 @@ algorithms:
 # ---------- 实验计划 ----------
 # 执行顺序(总策略:λ 扫描 → EXP1 选胜者 → EXP2/3 → EXP4 汇总):
 #   0. smoke_batch         批量调度验证
-#   1. lambda_sweep        【HDDM_W 分支专属,EXP1 前置】每数据集扫最优 λ*
+#   1. lambda_sweep_{abrupt,gradual}  【HDDM_W 分支专属,EXP1 前置】每数据集扫最优 λ*
 #   2. exp1_hddm_w         HDDM_W 分支,用各数据集 λ* 跑核心网格
 #   3. exp1_iks            IKS 分支,跑同一核心网格
 #      → 比较 exp1_hddm_w 与 exp1_iks 的 overall_auc,胜者为主检测器
@@ -62,16 +62,26 @@ plans:
   # 目的:为 HDDM_W 在每个数据集上定最优 λ*,避免 EXP1 用未调好的 λ 与 IKS 比较
   # 而引入"参数没调好"混淆。每数据集各取最优 λ(abrupt/gradual 最优 λ 可能不同,
   # 这一差异本身是发现:HDDM_W 最优 λ 依赖漂移形态)。
-  # 规模 = 2 datasets × 3 λ × 1 pauseMode(BACKLOG)× 3 repeats = 18
-  # 只在 BACKLOG 下扫(生产意图模式,主指标口径);P 固定为 4(EXP1 主对比并行度)。
+  # 拆成两个单数据集 plan,契合 cfg_query 的 expand_sensitivity(单 dataset/config + grids;
+  # 不支持复数 datasets + grids 组合)。每个 = 3 λ × BACKLOG × 3 repeats = 9,合计 18。
+  # 只在 BACKLOG 下扫(生产意图模式,主指标口径)。并行度走 LocalProcessor 默认 P=4
+  # (EXP1 主对比并行度;expand_sensitivity 的并行列为 _,不传 --parallelism → Java 默认 4)。
   # 仅在 feature/per-feature-hddm_w 分支运行。
-  lambda_sweep:
+  lambda_sweep_abrupt:
     algorithms: [HDDM_W]
-    datasets:
-      - insects_abrupt_imbalanced
-      - insects_gradual_imbalanced
-    configs: [BACKLOG_THEN_NEW_FOREST]
-    parallelism_grid: [4]
+    dataset: insects_abrupt_imbalanced
+    config: BACKLOG_THEN_NEW_FOREST
+    repeats: 3
+    plan_extras:
+      hddmScaleMode: p99
+      aggK: 2
+    grids:
+      hddmLambda: [0.002, 0.005, 0.01]
+
+  lambda_sweep_gradual:
+    algorithms: [HDDM_W]
+    dataset: insects_gradual_imbalanced
+    config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     plan_extras:
       hddmScaleMode: p99
@@ -80,7 +90,7 @@ plans:
       hddmLambda: [0.002, 0.005, 0.01]
 
   # ---- 2. EXP1 — HDDM_W 臂(在 feature/per-feature-hddm_w 分支跑)----
-  # 用 lambda_sweep 选出的各数据集 λ* 填入。注意:两个数据集若 λ* 不同,需拆成两次
+  # 用 lambda_sweep_{abrupt,gradual} 选出的各数据集 λ* 填入。注意:两个数据集若 λ* 不同,需拆成两次
   # 运行(每次单数据集 + 对应 λ),或在 run-batch 支持 per-dataset extra 时一次跑完。
   # 规模 = 2 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats = 36
   exp1_hddm_w:
@@ -94,9 +104,9 @@ plans:
     plan_extras:
       hddmScaleMode: p99
       aggK: 2
-      # hddmLambda 由 lambda_sweep 结果填入(每数据集各自 λ*);
+      # hddmLambda 由 lambda_sweep_{abrupt,gradual} 结果填入(每数据集各自 λ*);
       # 若 abrupt/gradual 的 λ* 不同,见上方注释拆分运行。
-      hddmLambda: 0.005   # 占位默认,跑前据 lambda_sweep 替换
+      hddmLambda: 0.005   # 占位默认,跑前据 lambda_sweep_{abrupt,gradual} 替换
 
   # ---- 3. EXP1 — IKS 臂(在 feature/per-feature-iks 分支跑)----
   # 与 HDDM_W 臂同网格、同配置,仅检测器不同(分支不同)。这是 EXP1 单变量对比的
@@ -166,7 +176,7 @@ plans:
 
   # ---- 8. HDDM_W 参数敏感性(OAT,HDDM_W 分支)----
   # 与 IKS sensitivity 对称,供论文并列呈现两检测器的参数稳健性。
-  # λ 已在 lambda_sweep 充分扫描,此处补 scaleMode 与 warmup 两个 HDDM_W 专属维度。
+  # λ 已在 lambda_sweep_{abrupt,gradual} 充分扫描,此处补 scaleMode 与 warmup 两个 HDDM_W 专属维度。
   # 在 feature/per-feature-hddm_w 分支运行。规模 ≈ 5 个独立点 × 3 = 15。
   sensitivity_hddm_w:
     algorithms: [HDDM_W]
@@ -174,13 +184,13 @@ plans:
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     plan_extras:
-      hddmLambda: 0.005     # 用 lambda_sweep 选出的 abrupt λ* 替换
+      hddmLambda: 0.005     # 用 lambda_sweep_abrupt 选出的 abrupt λ* 替换
       hddmScaleMode: p99
       aggK: 2
     grids:
       hddmScaleMode: [p99, maxdev]
       hddmWarmup: [1000, 2000, 4000]
 
-# ---------- λ 扫描结果回填区(lambda_sweep 跑完手动填)----------
+# ---------- λ 扫描结果回填区(lambda_sweep_{abrupt,gradual} 跑完手动填)----------
 # insects_abrupt_imbalanced:  λ* = ____  (overall_auc ____)
 # insects_gradual_imbalanced: λ* = ____  (overall_auc ____)
