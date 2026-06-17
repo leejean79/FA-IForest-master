@@ -28,6 +28,16 @@ configs:
   BACKLOG_THEN_NEW_FOREST:
     pauseMode: BACKLOG_THEN_NEW_FOREST
 
+# ---------- 算法 (配置级 --detector 切换) ----------
+# 检测器经配置级 --detector 选择:run-experiment.sh 见到 --algorithm <名> 后查
+# algorithms.<名>.detector,透传 --detector <值> 给 LocalProcessor。IKS 为默认路径,
+# 不需注册(plan 的 algo 取 "_" → 不传 --detector → LocalProcessor 默认 iks)。
+# HDDM_W 相关 plan(lambda_sweep / exp1_hddm_w / sensitivity_hddm_w)带 algorithms:[HDDM_W],
+# 使其在 feature/per-feature-hddm_w 分支上确实以 HDDM_W(而非默认 IKS)运行。
+algorithms:
+  HDDM_W:
+    detector: HDDM_W      # 经 run-experiment.sh --detector 传给 LocalProcessor
+
 # ---------- 实验计划 ----------
 # 执行顺序(总策略:λ 扫描 → EXP1 选胜者 → EXP2/3 → EXP4 汇总):
 #   0. smoke_batch         批量调度验证
@@ -56,6 +66,7 @@ plans:
   # 只在 BACKLOG 下扫(生产意图模式,主指标口径);P 固定为 4(EXP1 主对比并行度)。
   # 仅在 feature/per-feature-hddm_w 分支运行。
   lambda_sweep:
+    algorithms: [HDDM_W]
     datasets:
       - insects_abrupt_imbalanced
       - insects_gradual_imbalanced
@@ -73,6 +84,7 @@ plans:
   # 运行(每次单数据集 + 对应 λ),或在 run-batch 支持 per-dataset extra 时一次跑完。
   # 规模 = 2 datasets × 2 pauseMode × P∈{1,2,4} × 3 repeats = 36
   exp1_hddm_w:
+    algorithms: [HDDM_W]
     datasets:
       - insects_abrupt_imbalanced
       - insects_gradual_imbalanced
@@ -157,6 +169,7 @@ plans:
   # λ 已在 lambda_sweep 充分扫描,此处补 scaleMode 与 warmup 两个 HDDM_W 专属维度。
   # 在 feature/per-feature-hddm_w 分支运行。规模 ≈ 5 个独立点 × 3 = 15。
   sensitivity_hddm_w:
+    algorithms: [HDDM_W]
     dataset: insects_abrupt_imbalanced
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3

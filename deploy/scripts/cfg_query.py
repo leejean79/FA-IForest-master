@@ -138,13 +138,15 @@ def expand_sensitivity(plan):
     cfg = plan["config"]
     repeats = plan.get("repeats", 1)
     grids = plan["grids"]
+    # 检测器算法标签 (配置级 --detector): 取 plan 的 algorithms 首项, 缺省 "_" (默认 IKS)
+    algo = (plan.get("algorithms") or ["_"])[0]
     lines = []
     # 每个参数独立扫描 (one-at-a-time), 其他参数用默认
     for param, values in grids.items():
         for v in values:
             for r in range(1, repeats + 1):
-                # 格式: dataset config _ _ run param=value
-                lines.append(f"{ds} {cfg} _ _ {r} {param}={v}")
+                # 格式: dataset config algo _ run param=value
+                lines.append(f"{ds} {cfg} {algo} _ {r} {param}={v}")
     return lines
 
 def expand_configurations(plan):
@@ -154,12 +156,14 @@ def expand_configurations(plan):
     cfg = plan["config"]
     repeats = plan.get("repeats", 1)
     confs = plan["configurations"]   # list of dicts
+    # 检测器算法标签 (配置级 --detector): 取 plan 的 algorithms 首项, 缺省 "_" (默认 IKS)
+    algo = (plan.get("algorithms") or ["_"])[0]
     lines = []
     for conf in confs:
         # 把 dict 拼成 "k1=v1;k2=v2", 多对参数用分号分隔
         extra = ";".join(f"{k}={v}" for k, v in conf.items())
         for r in range(1, repeats + 1):
-            lines.append(f"{ds} {cfg} _ _ {r} {extra}")
+            lines.append(f"{ds} {cfg} {algo} _ {r} {extra}")
     return lines
 
 
