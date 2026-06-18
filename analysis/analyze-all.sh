@@ -93,9 +93,9 @@ if m:
     ds, cfg, algo, p = m.group(1), m.group(2), m.group(3), int(m.group(4))
 else:
     ds, cfg, algo, p = "?", "?", "?", -1
-# arm: 主路径 per-feature IKS = "new";EXP4 / 旧 build score 域 = "old"
-# 现版本所有 Phase 3 build 跑出的结果都是 new arm;若需对照旧 build,在结果目录用前缀区分
-arm = "new" if algo in ("default", "?") else "old"
+# arm: 直接用反解出的检测器名(default=per-feature IKS,HDDM_W=per-feature HDDM_W)。
+# 原 new/old 是 HDDM_W 引入前的 build 新旧语义,现已不适用(两检测器同属新 build)。
+arm = "iks" if algo in ("default", "?") else algo.lower()
 try:
     d = json.load(open("$out_json"))
     fields = [
