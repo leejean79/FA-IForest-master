@@ -132,19 +132,27 @@ plans:
       iksPValue: 0.001
       aggK: 2
 
-  # ---- 4. EXP2 — stationary 误触发率基线(主检测器,多样数据集)----
-  # per-feature 在无漂移流上应几乎不 fire = 精度基线。保留多样数据集(非 INSECTS),
-  # 因为误触发基线需要分布多样性,与"INSECTS 为主"不冲突。用 EXP1 选出的主检测器
-  # 所在分支跑。规模 = 5 datasets × 30 shuffle = 150。
+  # ---- 4. EXP2 — 分布式 iForest 准确性基线(stationary,主检测器 IKS)----
+  # 论文核心贡献②"分布式异常检测算法":证明 iForest 分布式化(列并行检测+分布式打分/重训)
+  # 后,stationary 准确性随并行度保持(P=1 准单机基线 → P=2/4 分布式,看 AUC 是否保持)。
+  # P=1 的 AUC 直接对照 Leveni 2025(Online Isolation Forest)Table 4 单机/在线 iForest 数字。
+  # 数据集与 Leveni 同源(直接下载),口径一致,可作对照(量级参考,选项 A)。
+  # 检测器=IKS(EXP1 主检测器),参数与 EXP1 一致;iForest 参数 totalTrees=100/subsample=256(默认)。
+  # pauseMode=BACKLOG(与 EXP1 同;stationary 下理想不触发重训,与 USE_OLD 趋同,取 BACKLOG 求一致)。
+  # 选 3 代表性数据集(算法间区分度高、维度/异常率多样、均大流):
+  #   donors(10维 5.9%)、forestcover(10维 0.9%)、fraud(29维 0.17%)。
+  #   舍 http(各算法近满分、无区分度)、mulcross(极端,主要是 HST 的故事)。
+  # 规模 = 3 ds × P∈{1,2,4} × 10 shuffle = 90。
   exp2:
-    datasets: [donors, http, forestcover, fraud, mulcross]
-    configs: [USE_OLD_FOREST]
-    repeats: 30
+    datasets: [donors, forestcover, fraud]
+    configs: [BACKLOG_THEN_NEW_FOREST]
+    parallelism_grid: [1, 2, 4]
+    repeats: 10
     shuffle: true
     plan_extras:
+      iksWindowSize: 2000
+      iksPValue: 0.001
       aggK: 2
-      # 检测器参数按主检测器所在分支填(IKS: iksWindowSize/iksPValue;
-      # HDDM_W: hddmLambda/hddmScaleMode)。
 
   # ---- 5. EXP3 — 扩展性 + Fork 2(主检测器,多样数据集)----
   # 升 Fork 2 时改 .env 的 SOURCE_PARTITIONS=P_d。保留 donors/http(大流、适合压扩展性)。
