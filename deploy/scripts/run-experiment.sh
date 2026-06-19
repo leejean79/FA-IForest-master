@@ -294,6 +294,10 @@ while true; do
     sleep "$POLL_INTERVAL"
 done
 
+# 处理期结束时刻(Step 6 等待循环退出);[LOAD_END, PROCESS_END] = 纯处理期,
+# 供 analyze.py --mode throughput 圈定 Prometheus 时间窗(排除灌数据期)。
+PROCESS_END=$(date +%s)
+
 # ============================================================================
 # Step 7: 收集结果 (Fix B:job 停后,按 latest-offset 总数一次性 dump scores)
 #
@@ -387,7 +391,10 @@ ssh_master "cat > $RESULT_DIR/job-config.json <<EOF
   \"n_samples\": $N_SAMPLES,
   \"final_offset\": $last_offset,
   \"status\": $STATUS,
-  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+  \"load_start_ts\": ${LOAD_START:-0},
+  \"load_end_ts\": ${LOAD_END:-0},
+  \"process_end_ts\": ${PROCESS_END:-0}
 }
 EOF"
 

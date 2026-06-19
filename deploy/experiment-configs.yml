@@ -163,6 +163,8 @@ plans:
     parallelism_grid: [1, 2, 4, 6]
     repeats: 3
     plan_extras:
+      iksWindowSize: 2000     # 与 EXP1/EXP2 一致(显式,不走代码兜底)
+      iksPValue: 0.001
       aggK: 2
 
   # ---- 6. EXP4 — 检测器–漂移形态匹配律 ----
