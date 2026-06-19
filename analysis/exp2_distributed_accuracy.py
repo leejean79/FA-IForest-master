@@ -82,8 +82,7 @@ def compute_auc(labels: np.ndarray, scores: np.ndarray) -> Optional[float]:
 
 
 def parse_run(path: Path) -> Optional[Dict]:
-    labels, scores = [], []
-    versions = set()
+    rows = []  # (seq, label, score, version)
     try:
         with open(path) as f:
             for line in f:
@@ -94,17 +93,53 @@ def parse_run(path: Path) -> Optional[Dict]:
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                labels.append(int(r.get("label", 0)))
-                scores.append(float(r.get("score", 0.0)))
-                fv = r.get("forestVersion")
-                if fv is not None:
-                    versions.add(fv)
+                rows.append((
+                    int(r.get("seq", len(rows))),
+                    int(r.get("label", 0)),
+                    float(r.get("score", 0.0)),
+                    r.get("forestVersion"),
+                ))
     except FileNotFoundError:
         return None
-    if not labels:
+    if not rows:
         return None
-    auc = compute_auc(np.array(labels), np.array(scores))
-    return dict(auc=auc, n=len(labels), n_false_retrains=max(len(versions) - 1, 0))
+    rows.sort(key=lambda x: x[0])  # 按 seq
+    labels = np.array([r[1] for r in rows])
+    scores = np.array([r[2] for r in rows])
+    versions = [r[3] for r in rows]
+    distinct_vers = sorted({v for v in versions if v is not None})
+    auc = compute_auc(labels, scores)
+
+    # per-version AUC:每个 forestVersion 段内的 AUC
+    per_version = {}
+    for v in distinct_vers:
+        idx = np.array([i for i, vv in enumerate(versions) if vv == v])
+        if idx.size == 0:
+            continue
+        va = compute_auc(labels[idx], scores[idx])
+        per_version[v] = dict(count=int(idx.size), auc=va)
+
+    # 重训前后 AUC 增量:每次版本切换(v→v+1),比较切换前一段 vs 后一段的 AUC。
+    # 无标注漂移点,故"恢复"定义为"重训后段 AUC 相对重训前段是否维持/提升"。
+    retrain_deltas = []
+    if len(distinct_vers) >= 2:
+        for k in range(len(distinct_vers) - 1):
+            v_pre, v_post = distinct_vers[k], distinct_vers[k + 1]
+            pre = per_version.get(v_pre, {}).get("auc")
+            post = per_version.get(v_post, {}).get("auc")
+            if pre is not None and post is not None:
+                retrain_deltas.append(dict(
+                    from_v=v_pre, to_v=v_post,
+                    auc_pre=pre, auc_post=post, delta=post - pre,
+                ))
+
+    return dict(
+        auc=auc, n=len(rows),
+        n_false_retrains=max(len(distinct_vers) - 1, 0),
+        n_versions=len(distinct_vers),
+        per_version=per_version,
+        retrain_deltas=retrain_deltas,
+    )
 
 
 def main():
@@ -136,6 +171,7 @@ def main():
         if st is None or st["auc"] is None:
             print(f"[WARN] {d.name}: 无有效 AUC,跳过")
             continue
+        st["exp_id"] = d.name
         groups.setdefault((ds, p), []).append(st)
 
     if not groups:
@@ -185,6 +221,47 @@ def main():
             print(f"{ds:<14} P1基线={base:.4f}  相对P1: {drop_str}  → {verdict}")
         else:
             print(f"{ds:<14} 缺 P=1 基线,无法判保持性")
+
+    # ---- 重训前后 AUC 增量(在线适应有效性,核心证据)----
+    # 论点:stationary 数据集本身含内在分布波动(故被在线异常检测文献选用);
+    # 系统的模型更新是对此的在线适应(同源 oIFOR/asdIFOR),非误触发。
+    # 判据:重训后段 AUC 相对重训前段维持/提升(delta≥0)→ 有效适应;持续显著下降 → 噪声过拟合。
+    rd_csv = OUT_DIR / "exp2_retrain_delta.csv"
+    print(f"\n{'='*64}\n重训前后 AUC 增量(在线适应有效性)\n{'-'*64}")
+    print(f"{'dataset':<14}{'P':>3}{'n_retrains':>11}{'delta_mean':>11}{'delta>=0占比':>13}")
+    with open(rd_csv, "w") as f:
+        f.write("dataset,parallelism,n_retrain_events,delta_mean,delta_std,frac_nonneg,"
+                "auc_pre_mean,auc_post_mean\n")
+        for ds in args.datasets:
+            for p in parallelisms:
+                runs = groups.get((ds, p), [])
+                if not runs:
+                    continue
+                deltas, pres, posts = [], [], []
+                for r in runs:
+                    for ev in r.get("retrain_deltas", []):
+                        deltas.append(ev["delta"]); pres.append(ev["auc_pre"]); posts.append(ev["auc_post"])
+                if not deltas:
+                    print(f"{ds:<14}{p:>3}{0:>11}  (无重训事件)")
+                    f.write(f"{ds},{p},0,,,,,\n")
+                    continue
+                dm = statistics.mean(deltas)
+                dstd = statistics.stdev(deltas) if len(deltas) > 1 else 0.0
+                frac_nonneg = sum(1 for d in deltas if d >= -0.005) / len(deltas)  # 容差 0.005
+                print(f"{ds:<14}{p:>3}{len(deltas):>11}{dm:>+11.4f}{frac_nonneg:>13.2f}")
+                f.write(f"{ds},{p},{len(deltas)},{dm:.4f},{dstd:.4f},{frac_nonneg:.4f},"
+                        f"{statistics.mean(pres):.4f},{statistics.mean(posts):.4f}\n")
+
+    # ---- per-version AUC(每次重训换进的森林质量,逐 run 明细)----
+    pv_csv = OUT_DIR / "exp2_per_version_auc.csv"
+    with open(pv_csv, "w") as f:
+        f.write("dataset,parallelism,exp_id,version,count,auc\n")
+        for (ds, p), runs in sorted(groups.items()):
+            for r in runs:
+                eid = r.get("exp_id", "")
+                for v, st in sorted(r.get("per_version", {}).items()):
+                    av = "" if st["auc"] is None else f"{st['auc']:.4f}"
+                    f.write(f"{ds},{p},{eid},{v},{st['count']},{av}\n")
 
     # ---- 对照 Leveni Table 4(用 P=1 准单机)----
     vs = OUT_DIR / "exp2_vs_leveni.csv"
