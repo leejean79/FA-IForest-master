@@ -24,6 +24,7 @@ CFG="python3 $SCRIPT_DIR/cfg_query.py"
 # ---------- 解析参数 ----------
 DATASET=""; CONFIG_ID=""; RUN_ID=""; PARALLELISM=""; ALGORITHM=""; SHUFFLE=false
 EXTRA_PARAM=""    # sensitivity 用, 形如 ringBufferSize=512
+DETECTION_FOLLOW_PARALLELISM=false   # EXP3:令检测面并行度 = 全局 parallelism
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dataset)     DATASET="$2"; shift 2 ;;
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --algorithm)   ALGORITHM="$2"; shift 2 ;;
         --shuffle)     SHUFFLE=true; shift ;;
         --extra-param) EXTRA_PARAM="$2"; shift 2 ;;
+        --detection-follow-parallelism) DETECTION_FOLLOW_PARALLELISM=true; shift ;;
         *) echo "Unknown arg: $1"; exit 3 ;;
     esac
 done
@@ -208,6 +210,8 @@ LOCAL_ARGS="--broker $BROKERS --topic $TOPIC_SOURCE \
     --pauseMode $PAUSE_MODE"
 # detector 参数 (EXP4 才用) 仍允许通过 --algorithm 走 algorithms 段
 [[ -n "$DETECTOR" ]] && LOCAL_ARGS="$LOCAL_ARGS --detector $DETECTOR"
+# EXP3:检测面并行度跟随全局 parallelism(source 仍受 1 分区限制单线;见 handover §0.2)
+[[ "$DETECTION_FOLLOW_PARALLELISM" == "true" ]] && LOCAL_ARGS="$LOCAL_ARGS --detectionParallelism $PARALLELISM"
 LOCAL_ARGS="$LOCAL_ARGS $EXTRA_ARGS"
 
 LOCAL_OUT=$(ssh_master "docker exec jobmanager flink run -d \

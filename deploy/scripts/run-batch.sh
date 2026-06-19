@@ -37,6 +37,10 @@ done
 NEED_SHUFFLE=false
 [[ "$PLAN" == "exp2" ]] && NEED_SHUFFLE=true
 
+# 实验 3 扩检测面并行度 = 全局 parallelism (source 仍 1 分区单线; handover §0.2/1.2)
+NEED_DETECTION_FOLLOW=false
+[[ "$PLAN" == "exp3" ]] && NEED_DETECTION_FOLLOW=true
+
 # 展开 plan → 实验列表
 mapfile_compat() {
     # bash 3.2 兼容: 把 plan 展开读进数组
@@ -56,6 +60,7 @@ fi
 echo "════════════════════════════════════════════════════"
 echo "BATCH: $PLAN  ($TOTAL experiments)"
 echo "  shuffle: $NEED_SHUFFLE"
+echo "  detection-follow-parallelism: $NEED_DETECTION_FOLLOW"
 echo "════════════════════════════════════════════════════"
 
 # dry-run: 只列
@@ -89,6 +94,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     [[ "$algo" != "_" ]] && ARGS+=(--algorithm "$algo")
     [[ "$par" != "_" ]] && ARGS+=(--parallelism "$par")
     $NEED_SHUFFLE && ARGS+=(--shuffle)
+    $NEED_DETECTION_FOLLOW && ARGS+=(--detection-follow-parallelism)
     [[ -n "${extra:-}" ]] && ARGS+=(--extra-param "$extra")
 
     bash "$SCRIPT_DIR/run-experiment.sh" "${ARGS[@]}"

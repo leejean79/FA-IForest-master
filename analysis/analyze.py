@@ -585,6 +585,45 @@ def query_prometheus(prom_url, query, start_ts, end_ts, step="15s"):
     return data["data"]["result"]
 
 
+# 扩展性三口径算子吞吐(handover v1.0-exp3 §0.3):
+#   source    端到端吞吐,受 source 单分区单线限制 → 暴露端到端瓶颈
+#   detection 检测面算子吞吐(Per-Feature IKS / HDDM_W),随并行度上升
+#   scoring   打分面算子吞吐(Local Processor),随并行度上升
+# 重要:operator_name label 实际值可能经 Prometheus 转义/截断,过滤式须在集群
+# Prometheus UI 实测校准(查 flink_taskmanager_job_task_operator_numRecordsIn 的
+# operator_name 取值),不可仅凭 LocalProcessor.java 的算子名假设(handover §3)。
+THROUGHPUT_OPERATOR_FILTERS = {
+    "source":    ".*Kafka Source.*",
+    "detection": ".*Per-Feature.*",
+    "scoring":   ".*Local Processor.*",
+}
+
+
+def _aggregate_throughput(series):
+    """把某算子 numRecordsIn rate 的多 subtask 序列按时间点求和 = 该算子总吞吐。
+    返回 stats dict;无匹配序列时返回 None(供上层标注"过滤式未命中")。"""
+    if not series:
+        return None
+    all_points = defaultdict(list)
+    for s in series:
+        for t, v in s["values"]:
+            all_points[float(t)].append(float(v))
+    if not all_points:
+        return None
+    timestamps = sorted(all_points.keys())
+    throughput = [sum(all_points[t]) for t in timestamps]
+    return {
+        "avg_throughput_rps": float(np.mean(throughput)),
+        "median_throughput_rps": float(np.median(throughput)),
+        "p95_throughput_rps": float(np.percentile(throughput, 95)),
+        "min_throughput_rps": float(np.min(throughput)),
+        "max_throughput_rps": float(np.max(throughput)),
+        "duration_seconds": float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0,
+        "n_samples": len(throughput),
+        "n_series": len(series),
+    }
+
+
 def mode_throughput(args):
     """从 Prometheus 拉吞吐 + 端到端业务延迟."""
     print("=" * 64)
@@ -595,41 +634,28 @@ def mode_throughput(args):
     
     # Part 1: Prometheus 吞吐量
     if args.prometheus:
-        print(f"\n[1] 拉取 Prometheus 吞吐数据 ({args.start} -> {args.end})")
-        # LocalProcessor numRecordsIn (Flink 1.13 默认 metric)
-        query = ('rate(flink_taskmanager_job_task_operator_numRecordsIn'
-                 '{operator_name=~".*Local Processor.*"}[1m])')
-        try:
-            series = query_prometheus(args.prometheus, query, args.start, args.end)
-            print(f"  {len(series)} 个时间序列")
-            
-            # 合并所有 subtask 的 numRecordsIn (平均, 因为 keyBy 均匀分发)
-            # 取每个时间点所有 subtask 之和 = 系统总吞吐
-            all_points = defaultdict(list)
-            for s in series:
-                for t, v in s["values"]:
-                    all_points[float(t)].append(float(v))
-            
-            # 每个时间点求和 (4 subtasks 总吞吐)
-            timestamps = sorted(all_points.keys())
-            throughput = [sum(all_points[t]) for t in timestamps]
-            
-            stats = {
-                "avg_throughput_rps": float(np.mean(throughput)),
-                "median_throughput_rps": float(np.median(throughput)),
-                "p95_throughput_rps": float(np.percentile(throughput, 95)),
-                "min_throughput_rps": float(np.min(throughput)),
-                "max_throughput_rps": float(np.max(throughput)),
-                "duration_seconds": float(timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0,
-                "n_samples": len(throughput),
-            }
-            print(f"  avg throughput: {stats['avg_throughput_rps']:.1f} records/sec")
-            print(f"  p95 throughput: {stats['p95_throughput_rps']:.1f} records/sec")
-            print(f"  duration: {stats['duration_seconds']:.1f} seconds")
-            result["throughput"] = stats
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            result["throughput"] = {"error": str(e)}
+        print(f"\n[1] 拉取 Prometheus 三口径吞吐 ({args.start} -> {args.end})")
+        # 三口径(source 端到端 / detection 检测面 / scoring 打分面)各拉一条 numRecordsIn rate;
+        # 每口径把所有 subtask 序列按时间点求和 = 该算子总吞吐。
+        tp_by_operator = {}
+        for kpi, opfilter in THROUGHPUT_OPERATOR_FILTERS.items():
+            query = ('rate(flink_taskmanager_job_task_operator_numRecordsIn'
+                     '{operator_name=~"' + opfilter + '"}[1m])')
+            try:
+                series = query_prometheus(args.prometheus, query, args.start, args.end)
+                stats = _aggregate_throughput(series)
+                if stats is None:
+                    print(f"  [{kpi:9}] 无匹配序列 — 校准 operator_name 过滤式: {opfilter}")
+                    tp_by_operator[kpi] = {"error": "no series matched", "filter": opfilter}
+                else:
+                    print(f"  [{kpi:9}] avg={stats['avg_throughput_rps']:.1f} rps, "
+                          f"p95={stats['p95_throughput_rps']:.1f} rps "
+                          f"({stats['n_series']} series, {stats['duration_seconds']:.0f}s)")
+                    tp_by_operator[kpi] = stats
+            except Exception as e:
+                print(f"  [{kpi:9}] ERROR: {e}")
+                tp_by_operator[kpi] = {"error": str(e), "filter": opfilter}
+        result["throughput"] = tp_by_operator
     
     # Part 2: 端到端业务延迟 (从 scores.jsonl 的 ingestionTime/scoreTime)
     if args.scores:
@@ -691,6 +717,14 @@ def mode_scalability(args):
     #     p4/throughput.json
     #     p6/throughput.json
     
+    KPIS = ["source", "detection", "scoring"]
+
+    def _kpi_avg(tp, kpi):
+        """取某口径 avg_throughput_rps;兼容旧单口径(flat)throughput.json → 视作 scoring。"""
+        if isinstance(tp, dict) and "avg_throughput_rps" in tp:
+            return tp.get("avg_throughput_rps") if kpi == "scoring" else None
+        return ((tp or {}).get(kpi, {}) or {}).get("avg_throughput_rps")
+
     rows = []
     for p_dir in sorted(runs_dir.iterdir()):
         if not p_dir.is_dir() or not p_dir.name.startswith("p"):
@@ -700,82 +734,86 @@ def mode_scalability(args):
         except ValueError:
             print(f"  跳过 {p_dir.name} (无法解析 parallelism)")
             continue
-        
+
         tp_file = p_dir / "throughput.json"
         if not tp_file.exists():
             print(f"  WARN: {tp_file} 不存在")
             continue
         with open(tp_file) as f:
             data = json.load(f)
-        
+
         tp = data.get("throughput", {})
         lat = data.get("latency", {})
-        
-        row = {
-            "parallelism": parallelism,
-            "avg_throughput_rps": tp.get("avg_throughput_rps"),
-            "p95_throughput_rps": tp.get("p95_throughput_rps"),
-            "median_latency_ms": lat.get("median_ms") if lat else None,
-            "p95_latency_ms": lat.get("p95_ms") if lat else None,
-            "p99_latency_ms": lat.get("p99_ms") if lat else None,
-        }
+
+        row = {"parallelism": parallelism}
+        for kpi in KPIS:
+            row[f"{kpi}_avg_rps"] = _kpi_avg(tp, kpi)
+        row["median_latency_ms"] = lat.get("median_ms") if lat else None
+        row["p95_latency_ms"] = lat.get("p95_ms") if lat else None
+        row["p99_latency_ms"] = lat.get("p99_ms") if lat else None
         rows.append(row)
-        print(f"  p{parallelism}: throughput={row['avg_throughput_rps']:.1f} rps")
-    
+        tp_str = ", ".join(
+            f"{kpi}={row[f'{kpi}_avg_rps']:.1f}" if row[f"{kpi}_avg_rps"] is not None else f"{kpi}=NA"
+            for kpi in KPIS)
+        print(f"  p{parallelism}: {tp_str} rps")
+
     if not rows:
         print(f"ERROR: 没有找到任何 parallelism 数据")
         return None
-    
+
     df = pd.DataFrame(rows).sort_values("parallelism")
-    
-    # 计算扩展比 (相对 p=1)
+
+    # 每口径相对 p=1 的 speedup(source 受单线限制预期接近持平;detection/scoring 随 P 上升)
     base = df[df["parallelism"] == 1]
     if len(base) > 0:
-        base_tp = base["avg_throughput_rps"].iloc[0]
-        df["speedup"] = df["avg_throughput_rps"] / base_tp
-        df["efficiency"] = df["speedup"] / df["parallelism"]
-        print(f"\n扩展性 (相对 p=1):")
-        for _, row in df.iterrows():
-            print(f"  p{row['parallelism']}: throughput={row['avg_throughput_rps']:.1f} rps, "
-                  f"speedup={row['speedup']:.2f}x, efficiency={row['efficiency']*100:.1f}%")
-    
+        for kpi in KPIS:
+            col = f"{kpi}_avg_rps"
+            base_v = base[col].iloc[0]
+            df[f"{kpi}_speedup"] = (df[col] / base_v) if (base_v and not pd.isna(base_v)) else float("nan")
+        print(f"\n扩展性 speedup (相对 p=1,三口径):")
+        for _, r in df.iterrows():
+            parts = ", ".join(
+                f"{kpi} {r[f'{kpi}_speedup']:.2f}x" if not pd.isna(r.get(f"{kpi}_speedup", float('nan'))) else f"{kpi} NA"
+                for kpi in KPIS)
+            print(f"  p{int(r['parallelism'])}: {parts}")
+
     if args.out_csv:
         df.to_csv(args.out_csv, index=False)
         print(f"\nCSV 写入: {args.out_csv}")
-    
+
     if args.out and args.out.endswith((".png", ".pdf", ".svg")):
         plt = _lazy_import_matplotlib()
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # 子图 1: 吞吐量
-        ax1.plot(df["parallelism"], df["avg_throughput_rps"], 
-                marker="o", linewidth=2, label="实测")
-        if len(base) > 0:
-            ideal = [base_tp * p for p in df["parallelism"]]
-            ax1.plot(df["parallelism"], ideal, 
-                    linestyle="--", color="gray", label="理想线性扩展")
+        markers = {"source": "^", "detection": "o", "scoring": "s"}
+
+        # 子图 1: 三口径吞吐
+        for kpi in KPIS:
+            col = f"{kpi}_avg_rps"
+            if df[col].notna().any():
+                ax1.plot(df["parallelism"], df[col], marker=markers[kpi], linewidth=2, label=kpi)
         ax1.set_xlabel("Parallelism")
         ax1.set_ylabel("Throughput (records/sec)")
-        ax1.set_title("吞吐量随并行度扩展")
+        ax1.set_title("三口径吞吐随并行度")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        
-        # 子图 2: 效率
-        if "efficiency" in df.columns:
-            ax2.plot(df["parallelism"], df["efficiency"] * 100, 
-                    marker="s", color="orange", linewidth=2)
-            ax2.axhline(100, linestyle="--", color="gray", alpha=0.5, label="理想 100%")
+
+        # 子图 2: 三口径 speedup + 理想线性
+        if len(base) > 0:
+            for kpi in KPIS:
+                col = f"{kpi}_speedup"
+                if col in df.columns and df[col].notna().any():
+                    ax2.plot(df["parallelism"], df[col], marker=markers[kpi], linewidth=2, label=kpi)
+            ax2.plot(df["parallelism"], df["parallelism"], linestyle="--", color="gray", label="理想线性")
             ax2.set_xlabel("Parallelism")
-            ax2.set_ylabel("Efficiency (%)")
-            ax2.set_title("并行效率 (speedup/parallelism)")
-            ax2.set_ylim(0, 110)
+            ax2.set_ylabel("Speedup (× over p=1)")
+            ax2.set_title("三口径 speedup")
             ax2.legend()
             ax2.grid(True, alpha=0.3)
-        
+
         plt.tight_layout()
         plt.savefig(args.out, dpi=150, bbox_inches="tight")
         print(f"图表写入: {args.out}")
-    
+
     return df.to_dict(orient="records")
 
 

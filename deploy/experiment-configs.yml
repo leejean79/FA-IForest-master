@@ -154,9 +154,12 @@ plans:
       iksPValue: 0.001
       aggK: 2
 
-  # ---- 5. EXP3 — 扩展性 + Fork 2(主检测器,多样数据集)----
-  # 升 Fork 2 时改 .env 的 SOURCE_PARTITIONS=P_d。保留 donors/http(大流、适合压扩展性)。
-  # 规模 = 2 datasets × P∈{1,2,4,6} × 3 repeats = 24。
+  # ---- 5. EXP3 — 分布式扩展性(主检测器 IKS,多样数据集)----
+  # 核心决定(handover v1.0-exp3 修订版 §0):source-topic 保持 1 分区(保数据时序,
+  # 不改 SOURCE_PARTITIONS);随 parallelism 扩的是检测面 + 打分面,source 单线为有意约束。
+  # run-batch 对 exp3 自动加 --detection-follow-parallelism,令检测面并行度 = 全局 parallelism。
+  # 扩展性双口径报告(§0.3):算子吞吐(检测/打分,随 P 上升)+ 端到端吞吐(source,受单线限制)。
+  # 保留 donors/http(大流、适合压扩展性)。规模 = 2 datasets × P∈{1,2,4,6} × 3 repeats = 24。
   exp3:
     datasets: [donors, http]
     configs: [BACKLOG_THEN_NEW_FOREST]
