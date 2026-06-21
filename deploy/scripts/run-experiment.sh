@@ -396,6 +396,8 @@ ssh_master "cat > $RESULT_DIR/job-config.json <<EOF
   \"final_offset\": $last_offset,
   \"status\": $STATUS,
   \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+  \"flink_local_job_id\": \"$LOCAL_JID\",
+  \"flink_coord_job_id\": \"$COORD_JID\",
   \"load_start_ts\": ${LOAD_START:-0},
   \"load_end_ts\": ${LOAD_END:-0},
   \"process_end_ts\": ${PROCESS_END:-0}
