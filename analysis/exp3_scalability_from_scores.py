@@ -95,6 +95,27 @@ def parse_run(path: Path) -> Optional[Dict]:
     gaps_ms = np.diff(s_sorted)
     gaps_ms = gaps_ms[gaps_ms >= 0]
 
+    # 堆积检测:若数据在堆积,raw_lat 随处理进程单调增长(越后的数据等越久)。
+    # 按 ingestionTime(摄入顺序)排序 raw_lat,比较前半段 vs 后半段中位。
+    # 后半段显著大于前半段 → 堆积 → 该 run 延迟失真,应作废重调低 rate。
+    backlog_flag = False
+    backlog_ratio = float("nan")
+    lat_first_half = float("nan")
+    lat_second_half = float("nan")
+    if valid.sum() >= 10:
+        ing_valid = ing_arr[valid]
+        order = np.argsort(ing_valid)            # 按摄入时间排序
+        lat_ordered = raw_lat_ms[order]
+        h = len(lat_ordered) // 2
+        lat_first_half = float(np.median(lat_ordered[:h]))
+        lat_second_half = float(np.median(lat_ordered[h:]))
+        # 比值:后半 / 前半。>2 视为明显堆积(后段延迟翻倍以上)
+        if lat_first_half > 0:
+            backlog_ratio = lat_second_half / lat_first_half
+            backlog_flag = backlog_ratio > 2.0
+        elif lat_second_half > 50:  # 前半≈0 但后半明显非零,也算堆积苗头
+            backlog_flag = True
+
     def pct(a, q):
         return float(np.percentile(a, q)) if a.size else float("nan")
 
@@ -106,6 +127,10 @@ def parse_run(path: Path) -> Optional[Dict]:
         raw_lat_p95_ms=pct(raw_lat_ms, 95),
         gap_median_ms=float(np.median(gaps_ms)) if gaps_ms.size else float("nan"),
         gap_p95_ms=pct(gaps_ms, 95),
+        backlog_flag=backlog_flag,
+        backlog_ratio=backlog_ratio,
+        lat_first_half_ms=lat_first_half,
+        lat_second_half_ms=lat_second_half,
     )
 
 
@@ -150,11 +175,14 @@ def main():
     runs_csv = OUT_DIR / "exp3_scalability_runs.csv"
     with open(runs_csv, "w") as f:
         f.write("dataset,parallelism,exp_id,n,throughput_rps,score_span_s,"
-                "raw_lat_median_ms,raw_lat_p95_ms,gap_median_ms,gap_p95_ms\n")
+                "raw_lat_median_ms,raw_lat_p95_ms,gap_median_ms,gap_p95_ms,"
+                "backlog_flag,backlog_ratio,lat_first_half_ms,lat_second_half_ms\n")
         for ds, p, s in run_rows:
             f.write(f"{ds},{p},{s['exp_id']},{s['n']},{s['throughput_rps']:.2f},"
                     f"{s['score_span_s']:.2f},{s['raw_lat_median_ms']:.2f},"
-                    f"{s['raw_lat_p95_ms']:.2f},{s['gap_median_ms']:.4f},{s['gap_p95_ms']:.4f}\n")
+                    f"{s['raw_lat_p95_ms']:.2f},{s['gap_median_ms']:.4f},{s['gap_p95_ms']:.4f},"
+                    f"{int(s['backlog_flag'])},{s['backlog_ratio']:.2f},"
+                    f"{s['lat_first_half_ms']:.1f},{s['lat_second_half_ms']:.1f}\n")
 
     # 汇总 + 扩展性
     summ_csv = OUT_DIR / "exp3_scalability_summary.csv"
@@ -189,12 +217,27 @@ def main():
                         f"{speedup:.4f},{gap_m:.4f},{rawl_m:.2f}\n")
     print("=" * 78)
     print(f"[OK] {summ_csv}\n[OK] {runs_csv}")
+
+    # 堆积检测汇总(延迟 run 有效性把关)
+    flagged = [(ds, p, s) for ds, p, s in run_rows if s.get("backlog_flag")]
+    print(f"\n{'='*78}\n堆积检测(延迟 run 把关)\n{'-'*78}")
+    if flagged:
+        print(f"[警告] {len(flagged)} 个 run 检测到堆积(后半段 raw_lat > 前半段 ×2),"
+              f"延迟失真,应作废、调低 rate 重跑:")
+        for ds, p, s in flagged:
+            print(f"  {ds} P={p}: raw_lat 前半 {s['lat_first_half_ms']:.0f}ms → "
+                  f"后半 {s['lat_second_half_ms']:.0f}ms (×{s['backlog_ratio']:.1f})  {s['exp_id']}")
+        print("  → 这些 run 的 raw_lat 不可作为处理延迟。降低 JOB_LOAD_RATE(如减半)重跑。")
+    else:
+        print("[OK] 未检测到明显堆积(各 run 后/前半段 raw_lat 比值 ≤2)。")
+        print("     raw_lat 反映真实处理延迟(摄入→打分,未在 backlog 排队),可用于延迟分析。")
+
     print("\n口径说明(写入论文):")
     print("  • 吞吐 = n / scoreTime_span(端到端打分产出速率;source 单线,含 source 瓶颈)。")
     print("  • speedup = 吞吐(P) / 吞吐(P=1);若 <P 为 sub-linear(source 单线预期内)。")
     print("  • gap_median_ms = 相邻打分间隔中位(稳态处理节奏,不含 backlog 排队)。")
-    print("  • raw_lat = scoreTime−ingestionTime:BACKLOG 下含 backlog 排队,非纯处理延迟,")
-    print("    仅作参考上界,不可直接当系统处理延迟报告。")
+    print("  • raw_lat = scoreTime−ingestionTime:未堆积时=真实处理延迟(摄入→打分完成);")
+    print("    堆积时含排队失真(见上方堆积检测)。延迟 run 须用未堆积的 rate。")
 
 
 if __name__ == "__main__":

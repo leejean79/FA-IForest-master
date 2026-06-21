@@ -258,10 +258,10 @@ LOAD_TIMEOUT=$(( N_SAMPLES / JOB_LOAD_RATE * 3 / 2 + 60 ))   # 1.5x 灌入时间
 PROCESS_TIMEOUT=600                                          # 灌完后 10 分钟
 DEADLINE=$(( $(date +%s) + LOAD_TIMEOUT + PROCESS_TIMEOUT ))
 
-STABLE_POLLS=5         # 连续 N 次轮询 offset 不动 = 视为完成
-#STABLE_POLLS=${STABLE_POLLS:-12}
-POLL_INTERVAL=10       # 每 10 秒一轮 → 50s no-progress 即收尾
-#POLL_INTERVAL=${POLL_INTERVAL:-10}
+#STABLE_POLLS=5         # 连续 N 次轮询 offset 不动 = 视为完成
+STABLE_POLLS=${STABLE_POLLS:-12}
+#POLL_INTERVAL=10       # 每 10 秒一轮 → 50s no-progress 即收尾
+POLL_INTERVAL=${POLL_INTERVAL:-10}
 
 last_offset=0
 stable_count=0
