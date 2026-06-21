@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run-exp3-batch.sh — 批量跑 EXP3(吞吐口径),每个 run 正确同步 detectionParallelism
+# run-exp3-batch.sh — 批量跑 EXP3(吞吐口径),每个 run 同步 detectionParallelism
 #
-# 与 run-batch.sh --plan exp3 的关系(两条路径并存,均令 detectionParallelism=P):
-#   run-batch.sh --plan exp3 现已自动加 --detection-follow-parallelism,使检测面并行度=P
-#   (非旧说法"检测面恒为单并行度"——该限制已随 detection-follow 开关消除)。本脚本是
-#   EXP3 吞吐口径的专用驱动:循环调 run-exp3-single.sh(经 --extra-param 设
-#   detectionParallelism=P),逐 run 同步,面向吞吐/扩展性收尾流程。两者择一即可。
+# v2 修订(修复卡顿):
+#   - 去掉循环内的 clean-topics preflight。原因:
+#     (1) clean-topics.sh 默认 RUN_MODE=remote,本脚本未传 RUN_MODE=local → 它走 SSH
+#         (mac 密钥路径),在 master 本地跑会卡到 SSH 超时(~20 分钟)才跳过。
+#     (2) 多余:output-scores 只要一开始建足 ≥ max(P) 分区,整批共用即可,无需每 P 重建。
+#   - 去掉 docker-logs 抓 job_id + tsv:job_id 已由 run-experiment 写进每个 run 的
+#     job-config.json(flink_local_job_id),分析脚本直接从结果目录读,无需 tsv。
+#
+# 前置(批量前一次性做好,本脚本不再动 topic):
+#   - source-topic 保持 1 分区(SOURCE_PARTITIONS=1,保时序)。
+#   - output-scores 建足分区 ≥ max(parallelisms)(如 6)。确认:
+#       docker exec kafka-1 kafka-topics.sh --bootstrap-server <broker> --describe --topic output-scores
+#     若不足,本环境 local 直跑可:
+#       RUN_MODE=local bash deploy/scripts/clean-topics.sh --score-partitions 6
+#   - .env JOB_LOAD_RATE 设吞吐档(如 50000,解 producer 限速)。
 #
 # 用法(在 master,RUN_MODE=local):
 #   bash run-exp3-batch.sh
-#   bash run-exp3-batch.sh --datasets "donors http" --parallelisms "1 2 4 6" --repeats 3
+#   bash run-exp3-batch.sh --datasets "http" --parallelisms "1 2 4 6" --repeats 3
+#   bash run-exp3-batch.sh --datasets "donors" --parallelisms "6" --repeats 3   # 补跑
 #
-# 前置:
-#   - .env JOB_LOAD_RATE 已设为吞吐档(如 50000,解 producer 限速)。本脚本不改 .env。
-#   - source 保持 1 分区(SOURCE_PARTITIONS=1,保时序)。
-#   - P=6 需 output-scores 分区 ≥6:跑前 bash clean-topics.sh --score-partitions 6(或脚本自动,见下)。
-#   - run-exp3-single.sh 与本脚本在同目录(deploy/scripts/)。
-#
-# 产物:每个 run 一个结果目录(含 scores.jsonl + job-config.json),
-#       并把每个 run 的 job_id 追加进 exp3-jobids.tsv(供后续 Prometheus 分析对应)。
+# 产物:每 run 一个结果目录(scores.jsonl + job-config.json,后者含 flink_local_job_id)。
+# 分析:python3 exp3_throughput_batch.py --prometheus http://localhost:9090
 # ============================================================================
 set -uo pipefail
 
@@ -37,64 +42,46 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-JOBIDS_FILE="${SCRIPT_DIR}/exp3-jobids.tsv"
-echo -e "exp_id\tdataset\tparallelism\trun\tjob_id" > "$JOBIDS_FILE"
-
 TOTAL=0
 for ds in $DATASETS; do for p in $PARALLELISMS; do for r in $(seq 1 "$REPEATS"); do
     TOTAL=$((TOTAL+1))
 done; done; done
 
+MAXP=0; for p in $PARALLELISMS; do [[ "$p" -gt "$MAXP" ]] && MAXP=$p; done
+
 echo "============================================================"
-echo "EXP3 批量(吞吐):datasets=[$DATASETS] P=[$PARALLELISMS] repeats=$REPEATS"
-echo "总计 $TOTAL run。每 run detectionParallelism=P,source 单线。"
-echo "JOB_LOAD_RATE 取 .env 当前值(应为吞吐档 50000)。"
+echo "EXP3 批量(吞吐):datasets=[$DATASETS] P=[$PARALLELISMS] repeats=$REPEATS  共 $TOTAL run"
+echo "每 run detectionParallelism=P;source 单线(1 分区)。"
+echo "[前置自检] output-scores 分区需 >= ${MAXP}。确认:"
+echo "  docker exec kafka-1 kafka-topics.sh --bootstrap-server \$BROKER --describe --topic output-scores"
+echo "本脚本不动 topic(已去掉 clean-topics preflight)。JOB_LOAD_RATE 取 .env 当前值。"
 echo "============================================================"
 
-i=0
+i=0; ok=0; fail=0
 for ds in $DATASETS; do
   for p in $PARALLELISMS; do
-    # P=6(或 >score 分区)时确保 output-scores 分区足够
-    if [[ "$p" -ge 6 ]]; then
-        echo "[preflight] P=$p:确保 output-scores 分区 ≥ $p"
-        bash "${SCRIPT_DIR}/clean-topics.sh" --score-partitions "$p" 2>/dev/null || \
-            echo "  [warn] clean-topics 失败,确认手动已建足够分区"
-    fi
     for r in $(seq 1 "$REPEATS"); do
         i=$((i+1))
         echo ""
         echo "########## [$i/$TOTAL] $ds P=$p run=$r ##########"
-        RUN_MODE="${RUN_MODE:-local}" bash "${SCRIPT_DIR}/run-exp3-single.sh" "$ds" "$p" "$r"
-        rc=$?
-        if [[ $rc -ne 0 ]]; then
-            echo "[ERROR] $ds P=$p r=$r 失败(rc=$rc),继续下一个"
-            continue
+        if RUN_MODE="${RUN_MODE:-local}" bash "${SCRIPT_DIR}/run-exp3-single.sh" "$ds" "$p" "$r"; then
+            ok=$((ok+1))
+            exp_id="${ds}_BACKLOG_THEN_NEW_FOREST_default_p${p}_r${r}_detectionParallelism-${p}_iksWindowSize-2000_iksPValue-0.001_aggK-2"
+            echo "  [ok] $exp_id  (job_id 已在 job-config.json)"
+        else
+            fail=$((fail+1))
+            echo "  [ERROR] $ds P=$p r=$r 失败,继续下一个"
         fi
-        # 抓本 run 的 job_id(从 jobmanager 日志最近一次提交)
-        exp_id="${ds}_BACKLOG_THEN_NEW_FOREST_default_p${p}_r${r}_detectionParallelism-${p}_iksWindowSize-2000_iksPValue-0.001_aggK-2"
-        jid=$(docker logs jobmanager 2>&1 | grep -oE "Job [0-9a-f]{32}" | tail -1 | awk '{print $2}')
-        echo -e "${exp_id}\t${ds}\t${p}\t${r}\t${jid:-UNKNOWN}" >> "$JOBIDS_FILE"
-        echo "  job_id=${jid:-UNKNOWN}  (已记入 $JOBIDS_FILE)"
     done
   done
 done
 
 echo ""
 echo "============================================================"
-echo "[完成] $TOTAL run。job_id 映射表:$JOBIDS_FILE"
+echo "[完成] 成功 $ok / 失败 $fail / 共 $TOTAL"
 echo ""
-echo "[下一步 — 吞吐分析(在 master,job 跑完后尽快,趁 Prometheus 数据未过期)]"
-echo "逐 run 用 exp3_throughput_prom.py + 上表的 job_id。批量分析示例:"
-echo ""
-echo "  while IFS=\$'\\t' read -r exp_id ds p run jid; do"
-echo "    [[ \"\$exp_id\" == exp_id ]] && continue   # 跳表头"
-echo "    [[ \"\$jid\" == UNKNOWN ]] && continue"
-echo "    echo \"=== \$ds P=\$p r=\$run ===\""
-echo "    python3 ${SCRIPT_DIR}/exp3_throughput_prom.py \\"
-echo "        --prometheus http://localhost:9090 \\"
-echo "        --job-id \"\$jid\" --auto-window --parallelism \"\$p\" \\"
-echo "        --out results/\${exp_id}/throughput.json"
-echo "  done < $JOBIDS_FILE"
-echo ""
-echo "  汇总三口径 vs 并行度后,即得吞吐扩展性(端到端受单分区限、检测面随 P 变化)。"
+echo "[分析](跑完尽快,auto-window 回看窗口需覆盖整批跨度):"
+echo "  python3 ${SCRIPT_DIR}/exp3_throughput_batch.py --prometheus http://localhost:9090"
+echo "  # 只看某数据集: 加 --datasets donors"
+echo "  # 批次跨度大、早期 run 被跳过时: 告知 planning 调大 auto-window 回看窗口"
 echo "============================================================"

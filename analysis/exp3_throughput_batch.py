@@ -6,7 +6,8 @@ EXP3 吞吐批量分析 — 遍历结果目录,从每个 job-config.json 读 job
 
 数据源(无需 tsv,直接读结果目录):
   /opt/fa-iforest/results/<exp_id>/job-config.json
-    需含:flink_local_job_id(dev diff 已加)、load_end_ts、process_end_ts、parallelism、dataset
+    需含:flink_local_job_id(dev 项1 diff)、parallelism、dataset。
+    时间窗用 auto-window(从 job metrics 区间推断),不依赖 load_end/process_end(BACKLOG 下失真)。
   每 run 的 job_id 与目录绑定,不会对错。
 
 口径:三口径吞吐(source_ingress/detection/scoring)从 Prometheus 拉(见 exp3_throughput_prom 逻辑),
@@ -51,6 +52,22 @@ def prom_query_range(base, query, start, end, step=15):
     with urllib.request.urlopen(url, timeout=30) as r:
         d = json.loads(r.read())
     return d["data"]["result"] if d.get("status") == "success" else []
+
+
+def infer_window(base, job_id) -> Optional[tuple]:
+    """从该 job_id 的 numRecordsIn 时间序列存在区间推断 [start,end](auto-window)。
+    与 exp3_throughput_prom.py --auto-window 同逻辑,已验证可靠;不依赖 job-config 时间戳。"""
+    import time
+    q = f'flink_taskmanager_job_task_operator_numRecordsIn{{job_id="{job_id}"}}'
+    now = time.time()
+    series = prom_query_range(base, q, now - 21600, now, step=15)  # 过去 6h(批次跨度大,覆盖早期 run)
+    ts = []
+    for s in series:
+        for t, _ in s["values"]:
+            ts.append(float(t))
+    if not ts:
+        return None
+    return min(ts), max(ts)
 
 
 def tier_rps(base, tier_filter, start, end, job_id) -> float:
@@ -99,16 +116,15 @@ def main():
         ds = cfg.get("dataset")
         p = cfg.get("parallelism")
         jid = cfg.get("flink_local_job_id")
-        le = cfg.get("load_end_ts"); pe = cfg.get("process_end_ts")
         if args.datasets and ds not in args.datasets:
             continue
         if not jid or jid == "":
-            skipped.append((d.name, "无 flink_local_job_id(需 dev diff)")); continue
-        if not le or not pe or pe <= le:
-            # 时间窗无效(BACKLOG 下 process_end 可能过早),回退:用 job metrics 存在区间
-            # 这里简单用 [le, le+处理估计];更稳可在 exp3_throughput_prom 用 --auto-window。
-            skipped.append((d.name, f"时间窗无效 load_end={le} process_end={pe};建议单跑用 --auto-window"))
-            continue
+            skipped.append((d.name, "无 flink_local_job_id(需 dev 项1 diff)")); continue
+        # 时间窗:用 auto-window(从 job metrics 区间推断,已验证可靠,不依赖 job-config 失真时间戳)
+        win = infer_window(args.prometheus, jid)
+        if win is None:
+            skipped.append((d.name, f"job_id={jid[:8]} 无 metrics(过 retention 或未跑)")); continue
+        le, pe = win
         rps = {tier: tier_rps(args.prometheus, filt, le, pe, jid)
                for tier, filt in TIERS.items()}
         groups[(ds, p)].append(rps)
