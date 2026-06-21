@@ -2,10 +2,11 @@
 # ============================================================================
 # run-exp3-batch.sh — 批量跑 EXP3(吞吐口径),每个 run 正确同步 detectionParallelism
 #
-# 为什么不用 run-batch.sh --plan exp3:
-#   run-batch 从 plan 读固定的 extra(aggK=2),无法让 detectionParallelism 随并行度变,
-#   导致检测面恒为单并行度、检测面吞吐口径测不出扩展。本脚本循环调 run-exp3-single.sh
-#   (已正确设 detectionParallelism=P),逐 run 同步。
+# 与 run-batch.sh --plan exp3 的关系(两条路径并存,均令 detectionParallelism=P):
+#   run-batch.sh --plan exp3 现已自动加 --detection-follow-parallelism,使检测面并行度=P
+#   (非旧说法"检测面恒为单并行度"——该限制已随 detection-follow 开关消除)。本脚本是
+#   EXP3 吞吐口径的专用驱动:循环调 run-exp3-single.sh(经 --extra-param 设
+#   detectionParallelism=P),逐 run 同步,面向吞吐/扩展性收尾流程。两者择一即可。
 #
 # 用法(在 master,RUN_MODE=local):
 #   bash run-exp3-batch.sh
