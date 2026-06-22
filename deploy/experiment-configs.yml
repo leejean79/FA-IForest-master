@@ -201,16 +201,17 @@ plans:
   # 与 IKS sensitivity 对称,供论文并列呈现两检测器参数稳健性。λ 已在 lambda_sweep 充分
   # 扫描,此处补 scaleMode 与 warmup。用 configurations 形式(非 grids),以便每点携带
   # detector: HDDM_W —— grids/OAT 展开不透传 detector,会误跑 IKS。
-  # 规模 = 5 点 × 3 repeats = 15。hddmLambda 用 lambda_sweep 选出的 abrupt λ* 替换。
+  # 规模 = 4 点 × 3 repeats = 12。hddmLambda 已对齐 EXP1 选出的 abrupt λ*=0.002
+  # (lambda_sweep 结果,见上方 EXP1 注释:abrupt 单调越小越好);此处只补 scaleMode 与 warmup 维。
   sensitivity_hddm_w:
     dataset: insects_abrupt_imbalanced
     config: BACKLOG_THEN_NEW_FOREST
     repeats: 3
     configurations:
-      - { detector: HDDM_W, hddmLambda: 0.005, hddmScaleMode: p99,    hddmWarmup: 2000, aggK: 2 }
-      - { detector: HDDM_W, hddmLambda: 0.005, hddmScaleMode: maxdev, hddmWarmup: 2000, aggK: 2 }
-      - { detector: HDDM_W, hddmLambda: 0.005, hddmScaleMode: p99,    hddmWarmup: 1000, aggK: 2 }
-      - { detector: HDDM_W, hddmLambda: 0.005, hddmScaleMode: p99,    hddmWarmup: 4000, aggK: 2 }
+      - { detector: HDDM_W, hddmLambda: 0.002, hddmScaleMode: p99,    hddmWarmup: 2000, aggK: 2 }
+      - { detector: HDDM_W, hddmLambda: 0.002, hddmScaleMode: maxdev, hddmWarmup: 2000, aggK: 2 }
+      - { detector: HDDM_W, hddmLambda: 0.002, hddmScaleMode: p99,    hddmWarmup: 1000, aggK: 2 }
+      - { detector: HDDM_W, hddmLambda: 0.002, hddmScaleMode: p99,    hddmWarmup: 4000, aggK: 2 }
 
 # ---------- λ 扫描结果回填区(lambda_sweep 跑完手动填)----------
 # insects_abrupt_imbalanced:  λ* = ____  (overall_auc ____)
