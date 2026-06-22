@@ -1,0 +1,18 @@
+F=/Users/lijing/developer/FA-IForest/results-local/http_BACKLOG_THEN_NEW_FOREST_default_p4_r1_detectionParallelism-4_iksWindowSize-2000_iksPValue-0.001_aggK-2/scores.jsonl
+F2=/Users/lijing/developer/FA-IForest/results-local/donors_BACKLOG_THEN_NEW_FOREST_default_p4_r1_detectionParallelism-4_iksWindowSize-2000_iksPValue-0.001_aggK-2/scores.jsonl
+
+python -c "
+import json
+for name, path in [('http', '$F'), ('donors', '$F2')]:
+    total=zero=small=0; samples=[]
+    for line in open(path):
+        try: r=json.loads(line)
+        except: continue
+        total+=1
+        it=r.get('ingestionTime')
+        if it is None or it==0: zero+=1
+        elif it < 1577000000000: small+=1
+        if total<=5: samples.append((it, r.get('scoreTime')))
+    print(f'{name}: 总{total}, ingestionTime=0/None: {zero} ({100*zero/total:.1f}%), 异常小: {small}')
+    print(f'  前5条 (ingestionTime, scoreTime): {samples}')
+"

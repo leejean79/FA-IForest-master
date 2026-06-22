@@ -86,8 +86,17 @@ def parse_run(path: Path) -> Optional[Dict]:
     score_span_s = (score_arr.max() - score_arr.min()) / 1000.0
     throughput_rps = n / score_span_s if score_span_s > 0 else float("nan")
 
-    # 延迟视角 (a):raw = scoreTime − ingestionTime(含 backlog 排队,BACKLOG 下失真)
-    valid = ~np.isnan(ing_arr)
+    # 延迟视角 (a):raw = scoreTime − ingestionTime。
+    # 先过滤脏时间戳:ingestionTime 必须是合理毫秒戳(> 2020-01-01 ≈ 1.577e12)、
+    # ≤ scoreTime、且 raw_lat 在合理上界内(< 10 分钟 = 600000ms)。
+    # 脏值来源:某些记录 ingestionTime=0/缺失,导致 raw_lat 爆成天文数字(污染中位)。
+    MIN_TS = 1_577_000_000_000   # 2020-01-01 的毫秒戳;小于此视为脏
+    MAX_LAT = 600_000            # 10 分钟;超过视为脏(BACKLOG 不堆积时不应这么大)
+    valid = (~np.isnan(ing_arr)) & (ing_arr >= MIN_TS) & (score_arr >= ing_arr)
+    raw_all = np.where(valid, score_arr - ing_arr, np.nan)
+    valid = valid & (raw_all >= 0) & (raw_all <= MAX_LAT)
+    n_dirty = int(n - valid.sum())
+    frac_dirty = n_dirty / n if n else 0.0
     raw_lat_ms = (score_arr[valid] - ing_arr[valid]) if valid.any() else np.array([])
 
     # 延迟视角 (b):相邻打分间隔(按 scoreTime 排序),反映稳态处理节奏
@@ -131,6 +140,8 @@ def parse_run(path: Path) -> Optional[Dict]:
         backlog_ratio=backlog_ratio,
         lat_first_half_ms=lat_first_half,
         lat_second_half_ms=lat_second_half,
+        n_dirty=n_dirty,
+        frac_dirty=frac_dirty,
     )
 
 
@@ -217,6 +228,20 @@ def main():
                         f"{speedup:.4f},{gap_m:.4f},{rawl_m:.2f}\n")
     print("=" * 78)
     print(f"[OK] {summ_csv}\n[OK] {runs_csv}")
+
+    # 脏时间戳检测(数据质量把关)
+    dirty_runs = [(ds, p, s) for ds, p, s in run_rows if s.get("frac_dirty", 0) > 0.01]
+    print(f"\n{'='*78}\n脏时间戳检测(数据质量)\n{'-'*78}")
+    if dirty_runs:
+        print(f"[警告] {len(dirty_runs)} 个 run 的 ingestionTime 含 >1% 脏值"
+              f"(0/缺失/非法,致 raw_lat 失真):")
+        for ds, p, s in sorted(dirty_runs, key=lambda x: -x[2]["frac_dirty"]):
+            print(f"  {ds} P={p}: 脏 {s['frac_dirty']*100:.1f}% ({s['n_dirty']}/{s['n']})  "
+                  f"raw_lat(过滤后)中位={s['raw_lat_median_ms']:.0f}ms  {s['exp_id'][:40]}")
+        print("  → 脏值已从 raw_lat 统计中过滤。若脏值比例高(>50%),该 run 延迟不可信,")
+        print("    需查 ingestionTime 采集(为何该数据集/并行度的 record timestamp 缺失)。")
+    else:
+        print("[OK] 各 run 脏时间戳 ≤1%,ingestionTime 采集正常。")
 
     # 堆积检测汇总(延迟 run 有效性把关)
     flagged = [(ds, p, s) for ds, p, s in run_rows if s.get("backlog_flag")]
