@@ -91,7 +91,7 @@ __pycache__/
 data/
 datasets/
 mock_data/
-results-local/
+results-sensitivity/
 # ==========================================
 # 8. Flink 本地运行状态与检查点 (Flink State)
 # ==========================================
