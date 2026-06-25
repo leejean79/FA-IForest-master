@@ -56,19 +56,33 @@ dev 把早先误写的"⌊P/2⌋+1 多数"拆分为:round 在「全员已报(yes
 
 两种症状相同(最终不产新森林)但成因相反的失效,由漂移强度区分。
 
-### 2a 弱漂移 → sub-quorum abort —— [诊断日志,标 VERIFY]
+### 2a 弱漂移 → sub-quorum abort —— **【修复前的动机现象;修复后已消除】**
 
-**机制**:稀释使任一投票窗口内通常只 1 个 subtask 越阈发起,余者投 NO,达不到多数流产。
+> ⚠️ **重要时序区分**(避免论文引用自相矛盾数据):
+> 早期诊断(协议修复前)观察到 sub-quorum abort;**当前定稿代码(并发 INITIATE 计 YES 的
+> 幂等修复已落地)经规范 EXP1 across-P 重跑,该现象已消除(0 ABORTED)**。
+> 故 2a 在论文中应写为「修复前的动机问题」,而非当前系统行为。
 
-**证据(13 轮)**:INSECTS abrupt,P=4,IKS:
-- 全程 **13 轮投票:12 ABORTED / 1 COMMITTED**。
-- 拆分:**10 轮 yes=1,no=3;2 轮 yes=2,no=2(仍 <quorum 3);1 轮 yes=3 → COMMITTED**。
-- 约 **92%** 投票轮因稀释凑不齐多数(quorum=⌊P/2⌋+1=3)。
-- ⚠️ VERIFY:来自诊断日志,投稿前用规范 EXP 记录终核。
+**机制(修复前)**:稀释 + 协议缺陷使任一投票窗口内通常只 1 个 subtask 越阈发起、其余被丢弃或投
+NO/弃权,达不到多数流产。
 
-> EN: *On INSECTS-abrupt with P=4, the system opened 13 rounds of which 12 aborted (ten at yes=1,
-> two at yes=2) and only one reached the quorum of 3 and committed — a ~92% quorum-failure rate
-> driven by per-branch dilution rather than absence of drift.*
+**修复前证据(13 轮)** —— [早期诊断日志,修复前,仅作动机]:
+- INSECTS abrupt,P=4,IKS,**修复前**:13 轮投票,12 ABORTED / 1 COMMITTED;
+  10 轮 yes=1,no=3;2 轮 yes=2,no=2;1 轮 yes=3 COMMITTED;~92% sub-quorum。
+- ⚠️ 此为**修复前**诊断,不代表当前系统;论文中作为「修复动机」陈述。
+
+**修复后验证(规范 EXP1 across-P,当前定稿代码)** —— [规范 EXP,可用]:
+- INSECTS abrupt,BACKLOG,3 repeats:
+  - P=1: 47 轮,**47 COMMITTED,0 ABORTED**;P=2: 47 轮,47 COMMITTED,0 ABORTED;
+    P=4: 48 轮,**48 COMMITTED,0 ABORTED**(sub-quorum 0%)。
+  - 多数轮为 yes=2,no=0(39/47),无 NO 票——并发 INITIATE 计 YES 后凑齐 quorum。
+- INSECTS gradual,3 repeats:P=1/2/4 各 27 轮,**全 COMMITTED,0 ABORTED**。
+- **结论:协议修复(并发 INITIATE 计 YES)将 sub-quorum 率从 ~92% 降至 0%,修复有效。**
+
+> EN: *Prior to the fix, INSECTS-abrupt at P=4 exhibited a ~92% quorum-failure rate (12/13 rounds
+> aborted). With the idempotent concurrent-INITIATE fix in the finalized system, a regularized
+> EXP1 across-P rerun yields 0 aborts (e.g., 48/48 committed at P=4; 47/47 at P=1, P=2), with most
+> rounds resolving yes=2,no=0 — demonstrating the fix eliminates the sub-quorum failure mode.*
 
 ### 2b 强漂移 → 发起竞争(initiate race)—— [诊断日志,标 VERIFY]
 
@@ -79,6 +93,9 @@ dev 把早先误写的"⌊P/2⌋+1 多数"拆分为:round 在「全员已报(yes
 - **修复前**:4 个 subtask 在 ~100ms 内全部 STABLE→DRIFT 并发 INITIATE;第一个开轮,
   其余 3 个被丢弃 → 该轮 **yes=1, no=0, abstain=3 → ABORTED**(一致检测却零通过)。
 - **修复后**(并发 INITIATE 计 YES):**yes=4 → COMMITTED**。
+- 注:2b(synth 强漂移)与 2a(INSECTS 弱漂移)是**同一修复(并发 INITIATE 计 YES)**消除的两个
+  症状;论文 §4.3 可统一为「修复前并发 INITIATE 致 abort(synth yes=1→aborted、INSECTS 12/13
+  aborted),修复后全 COMMITTED(synth yes=4、INSECTS 0 aborted)」一个自洽故事。
 - ⚠️ VERIFY:来自诊断日志;且 synth 数据集当时有 normal_mu_after 撞 anomaly_mu 的生成 bug
   (后修为 8.0),若重跑须用修复后的 synth。本演示仅示协议修复效果(yes 票数变化),不依赖数据质量。
 
@@ -100,6 +117,22 @@ dev 把早先误写的"⌊P/2⌋+1 多数"拆分为:round 在「全员已报(yes
 
 ---
 
+## 3.5 P-invariance(消稀释的正面证据,Table 2b)—— [规范 EXP,可用]
+
+规范 EXP1 across-P(IKS,BACKLOG,3 repeats):
+| 流 | overall_auc @N=1/2/4 | n_committed @N=1/2/4 |
+|---|---|---|
+| INSECTS abrupt | 0.699 / 0.725 / 0.761 | 16 / 16 / 16 |
+| INSECTS gradual | 0.558 / 0.554 / 0.653 | 9 / 9 / 9 |
+
+- **n_committed 严格 P-invariant**(16/16/16、9/9/9)——漂移响应提交次数对并行度 N 完全不变,
+  **直接坐实 per-feature 消稀释**(检测按 featureId 分,不随全局 P 切分)。这是 Table 2b 核心证据。
+- **overall_auc 随 N 略升**(非 P-invariant):**不可写成"AUC 对 N 不变"**。原因是 n_retrains 随 N 降
+  (abrupt 15→15→7,gradual 8→8→2)——低并行度过度重训反拖累 AUC。AUC 变化是**重训频率副作用**,
+  非检测灵敏度变化(灵敏度由 n_committed 证明不变)。论文须分开陈述这两个量。
+- **与行并行 baseline 对照**:行并行(HDDM)P=1→4 时 WARN 342→0(稀释);per-feature 此处
+  n_committed 16→16(不变)。两者对照坐实「per-feature 架构消除了行并行的稀释」。
+
 ## 4. quorum 作为灵敏度旋钮(§4.3 / 讨论)—— [机制分析]
 
 模式 2a 无法靠协议改写消除(是发现一的直接后果)。quorum 阈值 `⌊P/2⌋+1` 是"灵敏度 vs 误提交"
@@ -110,7 +143,10 @@ dev 把早先误写的"⌊P/2⌋+1 多数"拆分为:round 在「全员已报(yes
 
 ## 5. 写作注意(诚实性边界)
 - **342/0 WARN 是 HDDM**,13 轮/synth 修复是 IKS——正文勿混检测器。
-- 所有数标 [既往运行/诊断日志] 的,VERIFY 保留,以规范 EXP1/EXP4 记录终核确切值;若有出入以规范记录为准。
+- **2a 的"13 轮 92%"是修复前数据**,当前系统经规范 EXP1 已是 0 ABORTED——论文中 2a 必须
+  写成「修复前动机」,引用当前行为须用规范 EXP 的 0-abort 数据,**切勿混用致自相矛盾**。
+- n_committed P-invariant(规范 EXP,可用)是 Table 2b 硬证据;overall_auc 随 N 升须分开讲(重训副作用)。
+- 其余标 [既往运行/诊断日志] 的,VERIFY 保留,以规范记录终核。
 - aggK 精确语义未确认,正文一句带过,勿猜。
 - synth 数据曾有生成 bug(normal_mu_after=anomaly_mu),2b 修复演示只示协议效果(yes 票变化),
   不作 synth 的准确性结论。
