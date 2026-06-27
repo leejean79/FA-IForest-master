@@ -249,14 +249,3 @@ system or the paper**. The current design corresponds to
 
 ---
 
-## 11. Citation
-
-```bibtex
-@article{faiforest,
-  title   = {FA-IForest: A Distributed, Drift-Adaptive Isolation Forest for Stream Processing on Apache Flink},
-  author  = {<authors>},
-  journal = {Journal of Big Data},
-  year    = {<year>},
-  note    = {To appear}
-}
-```
