@@ -88,7 +88,7 @@ __pycache__/
 # 7. 本地数据存放目录 (Data Directories)
 # ==========================================
 # 强烈建议您在项目根目录建一个 data/ 文件夹放数据，并在此整体屏蔽
-data/
+#data/
 datasets/
 mock_data/
 results-sensitivity/
